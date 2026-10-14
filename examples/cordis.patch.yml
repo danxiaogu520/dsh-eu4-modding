@@ -1,0 +1,29 @@
+# Optional overrides. Installation works without this file.
+# Append this patch to $DSH_HOME/profiles/<profile>/cordis.patch.yml when needed.
+# The installed bundle already inserts the eu4-modding row.
+- id: eu4-modding
+  config:
+    serverPath: auto
+    serverVersion: latest
+    workspace: ''
+    timeoutMs: 300000
+    maxWorkspaces: 3
+    maxOutputChars: 24000
+    autoRefresh: true
+    # Shared analysis settings are read from .vscode/settings.json by default.
+    # Explicit overrides here take priority:
+    # vanillaMode: auto
+    # preferredLocalisationLanguages: [english]
+    # Optional: pin a verified server release, or use a local executable instead:
+    # workspace: /absolute/path/to/your-mod
+    # serverVersion: 0.5.2
+    # serverPath: /absolute/path/to/paradoxcode
+    # serverCacheDirectory: /absolute/path/to/server-cache
+    # downloadTimeoutMs: 300000
+    # Optional local game/index paths:
+    # gameDirectory: /absolute/path/to/Europa Universalis IV
+    # vanillaIndexCache: /absolute/path/to/vanilla.index
+    # dependencies:
+    #   - id: base-mod
+    #     path: /absolute/path/to/base-mod
+    #     index: /absolute/path/to/base-mod.index

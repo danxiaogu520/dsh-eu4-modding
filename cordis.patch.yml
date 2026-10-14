@@ -1,0 +1,4 @@
+- insert:
+    - id: eu4-modding
+      name: dsh-eu4-modding
+      config: {}
