@@ -77,7 +77,7 @@ export class LspConnection {
     try {
       const response = object(await this.request('initialize', {
         processId: process.pid,
-        clientInfo: { name: 'dsh-eu4-modding', version: '0.1.0' },
+        clientInfo: { name: 'dsh-eu4-modding', version: '0.1.1' },
         workspaceFolders: [{ uri: pathToFileURL(this.workspace).href, name: basename(this.workspace) }],
         capabilities: {
           window: { workDoneProgress: true },
@@ -108,23 +108,36 @@ export class LspConnection {
     if (this.failure) throw this.failure;
     const id = this.nextId++;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const onAbort = () => {
+    let cancelled: Error | undefined;
+    const cancel = (error: Error) => {
+      if (cancelled) return;
+      cancelled = error;
       try { this.notify('$/cancelRequest', { id }); } catch { /* already closed */ }
-      // Serial workspace calls let cancellation discard the entire overlay/session safely.
-      this.fail(abortError());
+      clearTimeout(timer);
+      // Drain the cancelled response before allowing another caller to use the snapshot.
+      // A backend that ignores cancellation is still reclaimed within a bounded grace period.
+      timer = setTimeout(() => this.fail(error), Math.min(1000, timeoutMs));
     };
+    const onAbort = () => cancel(abortError());
     try {
       return await new Promise<Json>((resolve, reject) => {
-        this.pending.set(id, { resolve, reject });
+        this.pending.set(id, {
+          resolve: value => cancelled ? reject(cancelled) : resolve(value),
+          reject: error => reject(cancelled ?? error),
+        });
         signal?.addEventListener('abort', onAbort, { once: true });
-        timer = setTimeout(() => this.fail(new Error(`ParadoxCode ${method} timed out after ${timeoutMs} ms. ${this.stderr}`)), timeoutMs);
+        timer = setTimeout(() => {
+          const error = new Error(`ParadoxCode ${method} timed out after ${timeoutMs} ms. ${this.stderr}`);
+          if (method === 'initialize' || method === 'shutdown') this.fail(error);
+          else cancel(error);
+        }, timeoutMs);
         try {
           checkAbort(signal);
           this.send({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) });
         } catch (error) { reject(asError(error)); }
       });
     } catch (error) {
-      if (!(error instanceof LspError)) await this.terminate();
+      if (!(error instanceof LspError) && (!cancelled || this.failure)) await this.terminate();
       throw error;
     } finally {
       clearTimeout(timer);

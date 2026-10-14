@@ -126,7 +126,9 @@ test('latest release is checksum verified, cached, upgraded on a new resolver an
   assert.equal(cached.version, '0.5.3');
   assert.match(cached.warning, /verified cached/);
   await writeFile(upgraded.path, 'corrupted executable');
-  await assert.rejects(resolveServer(config, undefined, offline), /offline/);
+  const older = await resolveServer(config, undefined, offline);
+  assert.equal(older.version, '0.5.2');
+  assert.deepEqual(await readFile(older.path), bytes);
 });
 
 test('fixed versions use the verified cache without GitHub and explicit executables bypass downloads', async t => {
@@ -139,6 +141,48 @@ test('fixed versions use the verified cache without GitHub and explicit executab
   const win = github(zip(Buffer.from('windows')), '0.5.2', { artifact: windows, platform: 'win32' });
   const result = await resolveServer(config, undefined, win);
   assert.ok(result.path.endsWith('paradoxcode.exe'));
+});
+
+test('latest can use a verified fixed-version cache without a latest pointer', async t => {
+  const config = await fixture(t, { serverVersion: '0.5.2' });
+  const mock = github(tar(Buffer.from('fixed cache')));
+  const pinned = await resolveServer(config, undefined, mock);
+  const latest = await resolveServer({ ...config, serverVersion: 'latest' }, undefined, { ...mock, fetch: async () => new Response(null, { status: 403 }) });
+  assert.equal(latest.path, pinned.path);
+  assert.match(latest.warning, /verified cached/);
+});
+
+test('API rate limits permit cold downloads through release redirects and bootstrap fallback', async t => {
+  for (const useRedirect of [true, false]) {
+    const config = await fixture(t);
+    const archive = tar(Buffer.from('cold verified server'));
+    const mock = github(archive);
+    const fetch = async (url, init) => {
+      const parsed = new URL(url);
+      if (parsed.hostname === 'api.github.com') return new Response(null, { status: 403 });
+      if (parsed.pathname.endsWith('/latest')) return new Response(null, useRedirect ? { status: 302, headers: { location: '/danxiaogu520/ParadoxCode/releases/tag/v0.5.2' } } : { status: 403 });
+      return mock.fetch(url, init);
+    };
+    const server = await resolveServer(config, undefined, { ...mock, fetch });
+    assert.equal(server.version, '0.5.2');
+    assert.deepEqual(await readFile(server.path), Buffer.from('cold verified server'));
+    assert.match(server.warning, useRedirect ? /web redirect/ : /bootstrap version/);
+  }
+});
+
+test('GitHub authentication stays on the API host across resource redirects', async t => {
+  const config = await fixture(t);
+  const archive = tar(Buffer.from('auth boundary'));
+  const mock = github(archive);
+  const previous = process.env.GH_TOKEN;
+  process.env.GH_TOKEN = 'test-token';
+  t.after(() => { if (previous === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = previous; });
+  const fetch = async (url, init) => {
+    if (new URL(url).hostname === 'api.github.com') assert.equal(init.headers.Authorization, 'Bearer test-token');
+    else assert.equal(init.headers.Authorization, undefined);
+    return mock.fetch(url, init);
+  };
+  await resolveServer(config, undefined, { ...mock, fetch });
 });
 
 test('concurrent downloads share a complete cache and corrupt receipts are repaired', async t => {

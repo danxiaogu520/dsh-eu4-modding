@@ -8,6 +8,7 @@ import { checkAbort, object, type Json, type JsonObject } from './json.js';
 import { LspConnection } from './lsp.js';
 import { resolveServer, type ServerResolution } from './server.js';
 import { loadWorkspace, type SharedWorkspace } from './settings.js';
+import { ResultStore } from './results.js';
 
 export function logicalPath(value: string): string {
   const path = value.replaceAll('\\', '/');
@@ -25,14 +26,18 @@ export function within(root: string, path: string): boolean {
 /** Sessions are serialized so temporary document overlays never leak to another agent. */
 export class WorkspaceSession {
   readonly connection: LspConnection;
+  readonly outputBudget: number;
   private watcher?: FSWatcher;
   private changed = 0;
   private synced = 0;
   private roots: string[];
   private version = 0;
+  private dirtyPaths = new Set<string>();
+  private broadDirty = false;
   watchWarning?: string;
 
-  constructor(readonly root: string, config: Config, readonly server: ServerResolution = { path: config.serverPath, source: 'local' }, public shared?: SharedWorkspace) {
+  constructor(readonly root: string, config: Config, readonly server: ServerResolution = { path: config.serverPath, source: 'local' }, public shared?: SharedWorkspace, readonly results = new ResultStore()) {
+    this.outputBudget = config.maxOutputChars;
     this.roots = [root];
     this.connection = new LspConnection(server.path, root, shared?.options ?? initializationOptions(config), config.timeoutMs);
     if (config.autoRefresh) {
@@ -41,7 +46,7 @@ export class WorkspaceSession {
           const path = filename?.toString().replaceAll('\\', '/');
           // Directory moves and .gui/.gfx edits affect analysis too.
           if (!path || !/(^|\/)(\.git|\.vscode|node_modules|\.paradoxcode|target)(\/|$)/.test(path)) {
-            this.markDirty();
+            this.markDirty(path ? resolve(root, path) : undefined);
           }
         });
         this.watcher.on('error', error => {
@@ -63,19 +68,79 @@ export class WorkspaceSession {
     await this.loadRoots(signal);
   }
 
-  markDirty(): void { this.changed++; }
+  markDirty(path?: string): void {
+    this.changed++;
+    this.results.invalidate();
+    if (path) this.dirtyPaths.add(resolve(path)); else this.broadDirty = true;
+  }
 
   async refresh(signal?: AbortSignal, force = false): Promise<Json | undefined> {
     if (!force && this.changed === this.synced) return undefined;
     const epoch = this.changed;
-    const result = await this.connection.request('workspace/executeCommand', { command: 'pdc/reindexWorkspace', arguments: [] }, signal);
+    const paths = [...this.dirtyPaths];
+    let incremental = !force && !this.broadDirty && paths.length > 0 && paths.length <= 256;
+    const changes: Json[] = [];
+    if (incremental) for (const path of paths) {
+      try {
+        if (!(await stat(path)).isFile()) { incremental = false; break; }
+        changes.push({ uri: pathToFileURL(path).href, type: 2 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        changes.push({ uri: pathToFileURL(path).href, type: 3 });
+      }
+    }
+    let result: Json;
+    if (incremental) {
+      this.connection.notify('workspace/didChangeWatchedFiles', { changes });
+      result = { ...object(await this.request('pdc/workspaceSummary', undefined, signal)), refreshMode: 'files', changedFiles: paths };
+    } else result = await this.connection.request('workspace/executeCommand', { command: 'pdc/reindexWorkspace', arguments: [] }, signal);
     await this.loadRoots(signal);
     this.synced = epoch;
+    if (this.changed === epoch) { this.dirtyPaths.clear(); this.broadDirty = false; }
+    this.results.invalidate();
     return result;
   }
 
   request(method: string, params?: Json, signal?: AbortSignal): Promise<Json> {
     return this.connection.request(method, params, signal);
+  }
+
+  async withDrafts<T>(files: { path: string; text: string }[], signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+    const documents: { uri: string; path: string; text: string }[] = [];
+    // Validate every boundary before opening any overlay.
+    for (const file of files) {
+      logicalPath(file.path);
+      const path = resolve(this.root, file.path);
+      let ancestor = path;
+      for (;;) {
+        try { ancestor = await realpath(ancestor); break; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          const parent = resolve(ancestor, '..');
+          if (parent === ancestor) throw error;
+          ancestor = parent;
+        }
+      }
+      if (!within(this.root, ancestor)) throw new Error('Draft path resolves outside the Mod root');
+      if (Buffer.byteLength(file.text) > 4 * 1024 * 1024) throw new Error('Each draft must be at most 4 MiB');
+      documents.push({ ...file, uri: pathToFileURL(path).href });
+    }
+    const opened: string[] = [];
+    try {
+      for (const document of documents) {
+        checkAbort(signal);
+        this.connection.notify('textDocument/didOpen', { textDocument: { uri: document.uri, languageId: /\.ya?ml$/i.test(document.path) ? 'localisation' : 'eu4', version: ++this.version, text: document.text } });
+        opened.push(document.uri);
+      }
+      return await fn();
+    } finally {
+      if (this.connection.alive) {
+        for (const uri of opened.reverse()) this.connection.notify('textDocument/didClose', { textDocument: { uri } });
+        // Drain restoration before the next caller can enter this serialized session.
+        try { await this.request('pdc/workspaceSummary'); }
+        catch (error) { await this.stop(); throw error; }
+      }
+    }
   }
 
   async withDocument<T>(path: string, draft: string | undefined, signal: AbortSignal | undefined, fn: (uri: string, text: string) => Promise<T>): Promise<T> {
@@ -122,10 +187,11 @@ export class WorkspaceSession {
   }
 
   synchronization(): JsonObject {
-    return { watching: !!this.watcher, ...(this.watchWarning ? { warning: this.watchWarning } : {}) };
+    return { watching: !!this.watcher, pendingChanges: this.changed - this.synced, changedFiles: [...this.dirtyPaths], ...(this.watchWarning ? { warning: this.watchWarning } : {}) };
   }
 
   async stop(): Promise<void> {
+    this.results.invalidate();
     this.watcher?.close();
     this.watcher = undefined;
     await this.connection.stop();
@@ -145,12 +211,26 @@ export class WorkspaceSession {
 
 export class WorkspacePool {
   private sessions = new Map<string, WorkspaceSession>();
+  private resultStores = new Map<string, ResultStore>();
   private tail: Promise<void> = Promise.resolve();
   private disposed = false;
   private server?: ServerResolution;
   private shutdown = new AbortController();
 
   constructor(private readonly config: Config) {}
+
+  resultsFor(root: string): ResultStore {
+    let store = this.resultStores.get(root);
+    if (!store) {
+      while (this.resultStores.size >= this.config.maxWorkspaces + 4) {
+        const unused = [...this.resultStores].find(([path]) => ![...this.sessions.values()].some(session => session.root === path));
+        if (!unused) throw new Error('Workspace result cache is full');
+        unused[1].invalidate(); this.resultStores.delete(unused[0]);
+      }
+      store = new ResultStore(); this.resultStores.set(root, store);
+    }
+    return store;
+  }
 
   private async exclusive<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
     const previous = this.tail;
@@ -196,7 +276,7 @@ export class WorkspacePool {
           await oldest[1].stop();
         }
         checkAbort(active);
-        session = new WorkspaceSession(shared.root, this.config, this.server, shared);
+        session = new WorkspaceSession(shared.root, this.config, this.server, shared, this.resultsFor(shared.root));
         this.sessions.set(root, session);
         try { await session.initialize(active); } catch (error) {
           this.sessions.delete(root);
@@ -212,8 +292,19 @@ export class WorkspacePool {
     });
   }
 
-  markDirty(): void {
-    if (this.config.autoRefresh) for (const session of this.sessions.values()) session.markDirty();
+  markDirty(path?: string): void {
+    if (!this.config.autoRefresh) return;
+    for (const session of this.sessions.values()) {
+      const roots = [session.root, ...(session.shared?.dependencies.map(row => row.path) ?? [])];
+      if (!path || roots.some(root => within(root, resolve(path)))) session.markDirty(path);
+    }
+  }
+
+  markUnwatched(workspace: string): void {
+    if (!this.config.autoRefresh) return;
+    for (const session of this.sessions.values()) {
+      if (!session.synchronization().watching && (within(session.root, workspace) || within(workspace, session.root))) session.markDirty();
+    }
   }
 
   async dispose(): Promise<void> {
@@ -224,5 +315,7 @@ export class WorkspacePool {
     await this.tail;
     await Promise.all([...this.sessions.values()].map(session => session.stop()));
     this.sessions.clear();
+    for (const store of this.resultStores.values()) store.invalidate();
+    this.resultStores.clear();
   }
 }

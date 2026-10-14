@@ -13,6 +13,12 @@ async function fixture(t) {
   return root;
 }
 
+test('large containers explain the discovery limit and accept an explicit Mod selection', async t => {
+  const root = await fixture(t);
+  await Promise.all(Array.from({ length: 65 }, (_, n) => mkdir(join(root, `folder-${n}`))));
+  await assert.rejects(discoverModRoot(root), /65 child directories.*workspace/);
+});
+
 test('session directories inside a Mod resolve to its nearest root', async t => {
   const root = await fixture(t);
   const child = join(root, 'common', 'scripted_effects');

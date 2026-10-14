@@ -3,10 +3,11 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineTool, type ParameterSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools';
-import type { Config } from './config.js';
+import { inheritedDefaults, type Config } from './config.js';
 import { object, type Json, type JsonObject } from './json.js';
 import { logicalPath, within, type WorkspacePool, type WorkspaceSession } from './workspace.js';
 import { manageDependencies } from './dependencies.js';
+import { ResultStore, assertSnapshotInput, diagnosticPage, nativeSummary } from './results.js';
 
 interface Spec {
   name: string;
@@ -48,45 +49,109 @@ function position(args: JsonObject, content: string): JsonObject {
   return { line, character };
 }
 
-function countDiagnostics(value: Json): JsonObject {
-  const counts = { errors: 0, warnings: 0, info: 0, hints: 0, total: 0 };
-  for (const entry of Array.isArray(value) ? value : []) {
-    const file = object(entry);
-    for (const diagnostic of Array.isArray(file.diagnostics) ? file.diagnostics : []) {
-      const d = object(diagnostic);
-      counts.total++;
-      if (d.severity === 1) counts.errors++;
-      else if (d.severity === 2) counts.warnings++;
-      else if (d.severity === 3) counts.info++;
-      else if (d.severity === 4) counts.hints++;
-    }
+const diagnosticParameters: ParameterSchemaSpec = {
+  severity: { type: 'string', enum: ['error', 'warning', 'info', 'hint'], description: 'Return only this severity; unfiltered counts remain available' },
+  codes: { type: 'array', items: { type: 'string' }, description: 'Include these diagnostic codes' },
+  excludeCodes: { type: 'array', items: { type: 'string' }, description: 'Exclude these diagnostic codes from this view' },
+  startLine: integer('First 1-based source line, inclusive'), endLine: integer('Last 1-based source line, inclusive'),
+  diagnosticOffset: integer('Diagnostic offset within this file page/batch, default 0'), diagnosticLimit: integer('Diagnostics per page, 1–500, default 50'),
+  snapshot: string('Snapshot returned by the first page; required to continue diagnostics without reanalysis'),
+  summaryOnly: { type: 'boolean', description: 'Return counts without diagnostic details' },
+};
+
+function diagnosticsSnapshot(session: WorkspaceSession, kind: string, args: JsonObject, raw?: Json): JsonObject {
+  kind = `${kind}:${session.shared?.fingerprint ?? ''}`;
+  const offset = number(args, 'diagnosticOffset', 0, 0, 10000000);
+  const limit = number(args, 'diagnosticLimit', 50, 1, 500);
+  const supplied = text(args, 'snapshot');
+  if (offset && !supplied) throw new Error('Continue with snapshot and nextDiagnosticOffset from the first page');
+  let token: string, input: JsonObject, value: Json;
+  if (supplied) {
+    const record = session.results.get(supplied, kind);
+    assertSnapshotInput(record.input, args);
+    token = supplied; input = record.input; value = record.value;
+  } else {
+    if (raw === undefined) throw new Error('A first diagnostic page requires files or a workspace query');
+    value = raw; input = { ...args }; token = session.results.save(kind, value, input);
   }
-  return counts;
+  return { ...diagnosticPage(value, { ...input, ...args }, offset, limit), snapshot: token, countsScope: kind.startsWith('disk:') ? 'returned file page before diagnostic slicing' : 'joint draft batch' };
 }
 
-function diagnosticFiles(value: Json): Json {
-  if (!Array.isArray(value)) throw new Error('Invalid diagnostics response');
-  return value.map(entry => {
-    const file = object(entry);
-    return {
-      ...file,
-      diagnostics: (Array.isArray(file.diagnostics) ? file.diagnostics : []).map(entry => {
-        const d = object(entry);
-        const start = object(object(d.range ?? {}).start ?? {});
-        return { ...d, line: typeof start.line === 'number' ? start.line + 1 : null };
-      }),
-    };
-  });
+async function queryPage(session: WorkspaceSession, method: string, args: JsonObject, params: JsonObject, signal: AbortSignal): Promise<Json> {
+  const offset = number(args, 'offset', 0, 0, 10000000);
+  const revision = args.revision;
+  const experimental = session.connection.capabilities.experimental;
+  const supported = experimental && typeof experimental === 'object' && !Array.isArray(experimental) && experimental.pdcQueryPagination === true;
+  if (offset && !supported) throw new Error('This server does not support legacy query pagination. Use paradoxcode_query with revision/snapshot, or install the supplied ParadoxCode patch.');
+  if (revision !== undefined && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) throw new Error('revision must be a non-negative integer');
+  if (offset && revision === undefined) throw new Error('Continuations require the revision returned by the first page');
+  const result = object(await session.request(method, { ...params, ...(supported ? { offset, ...(revision !== undefined ? { revision } : {}) } : {}) }, signal));
+  return { ...result, continuationSupported: !!supported, ...(!supported && result.truncated === true ? { continuation: 'Use paradoxcode_query to continue with the server search snapshot' } : {}) };
+}
+
+const queryParameters = { offset: integer('Result offset, default 0; continuations require a server advertising query pagination'), revision: integer('Revision returned by the first page; required when offset > 0') };
+
+function readStoredResult(store: ResultStore, args: JsonObject, budget: number): Json {
+  const token = text(args, 'token', true)!;
+  const record = store.get(token);
+  const offset = number(args, 'offset', 0, 0, record.text.length);
+  const limit = number(args, 'limit', Math.max(128, budget - 512), 1, Math.max(128, budget - 512));
+  if (offset > 0 && /[\uDC00-\uDFFF]/.test(record.text[offset]!)) throw new Error('offset splits a Unicode surrogate pair; use nextOffset');
+  let end = Math.min(record.text.length, offset + limit);
+  if (end < record.text.length && /[\uD800-\uDBFF]/.test(record.text[end - 1]!)) end--;
+  if (end === offset && end < record.text.length) throw new Error('limit is too small for the next Unicode character');
+  return { token, offset, totalChars: record.text.length, nextOffset: end < record.text.length ? end : null, complete: end === record.text.length, chunk: record.text.slice(offset, end) };
 }
 
 const specs: Spec[] = [
+  {
+    name: 'paradoxcode_result',
+    description: 'Read the complete canonical JSON of a previous oversized result in bounded text chunks. Use its retrieval token, then nextOffset until complete. No reanalysis. Tokens are workspace-local and expire after edits, refresh, eviction or restart. Offsets are UTF-16 character positions.',
+    parameters: { token: string('Result retrieval token', true), offset: integer('Character offset, default 0'), limit: integer('Characters per chunk; bounded by the native display budget') },
+    async run(session, args) { return readStoredResult(session.results, args, session.outputBudget); },
+  },
+  {
+    name: 'paradoxcode_query',
+    description: 'Paged ParadoxCode 0.5.2+ search for rules, definitions, localisation and text, including active/overridden versions. context returns root ids and available filters. Search continuations require offset, revision and snapshot. references uses a definition id/name/kind/revision from search. Preserve groups, matchCount and limitations; a bounded group is not exhaustive.',
+    parameters: {
+      action: { type: 'string', enum: ['context', 'search', 'references'], description: 'Default search' },
+      tab: { type: 'string', enum: ['rules', 'definitions', 'localisation', 'text'], description: 'Search tab, required for search' },
+      query: string('Non-empty search text'), context: string('Exact rule context'), scope: string('Exact allowed scope'), kind: string('Definition kind'), language: string('Localisation language'),
+      roots: { type: 'array', items: { type: 'integer' }, description: 'Source root ids from context' },
+      searchKeys: { type: 'boolean', description: 'Search localisation keys instead of values' }, caseSensitive: { type: 'boolean', description: 'Case-sensitive full-text search' },
+      status: { type: 'string', enum: ['all', 'active', 'overridden'], description: 'Default all; filtering does not promote overridden definitions' },
+      include: { type: 'array', items: { type: 'string' }, description: 'Included source globs' }, exclude: { type: 'array', items: { type: 'string' }, description: 'Excluded source globs' },
+      offset: integer('Server group offset, default 0'), revision: integer('Workspace revision from the first page'), snapshot: string('Opaque server snapshot from the first page'),
+      id: string('Definition identity for references'), name: string('Exact definition name for references'),
+    },
+    async run(session, args, signal) {
+      const action = text(args, 'action') ?? 'search';
+      if (action === 'context') return session.request('pdc/editorSearchContext', undefined, signal);
+      const offset = number(args, 'offset', 0, 0, 10000000);
+      if (offset && (args.revision === undefined || args.snapshot === undefined)) throw new Error('Continue using offset, revision and snapshot from the first page');
+      if (args.revision !== undefined) number(args, 'revision', 0, 0, Number.MAX_SAFE_INTEGER);
+      const params: JsonObject = { offset };
+      const fields = action === 'references' ? ['id', 'name', 'kind', 'revision', 'snapshot', 'roots'] : ['tab', 'query', 'roots', 'language', 'searchKeys', 'kind', 'context', 'scope', 'caseSensitive', 'include', 'exclude', 'status', 'revision', 'snapshot'];
+      for (const key of fields) if (args[key] !== undefined) params[key] = args[key]!;
+      if (action === 'references') {
+        for (const key of ['id', 'name', 'kind', 'revision']) if (params[key] === undefined) throw new Error(`${key} is required for references`);
+      } else if (params.tab === undefined || typeof params.query !== 'string' || !params.query.trim()) throw new Error('search requires tab and a non-empty query');
+      return session.request(action === 'references' ? 'pdc/editorSearchReferences' : 'pdc/editorSearch', params, signal);
+    },
+  },
   {
     name: 'paradoxcode_workspace',
     description: 'Orient in an EU4 Mod: indexed Mod/dependency/Vanilla roots, rule identity, revision, file counts and scan coverage. Call first. Missing Vanilla data or incomplete coverage limits what a clean diagnostic result proves.',
     parameters: {},
     async run(session, _args, signal) {
-      return { ...object(await session.request('pdc/workspaceSummary', undefined, signal)), capabilities: session.connection.capabilities, synchronization: session.synchronization(), server: { ...session.server, info: session.connection.serverInfo },
-        configuration: session.shared ? { settingsFile: session.shared.settings.path, dependenciesSource: session.shared.dependenciesSource, dependencies: session.shared.dependencies.map(row => ({ ...row })) } : null };
+      const summary = object(await session.request('pdc/workspaceSummary', undefined, signal));
+      const roots = (Array.isArray(summary.roots) ? summary.roots : []).map(entry => {
+        const root = object(entry);
+        const dependency = session.shared?.dependencies.find(dep => dep.path === root.path);
+        return { ...root, sourceRootId: root.id ?? null, id: dependency?.id ?? (root.kind === 'vanilla' ? 'vanilla' : root.writable ? 'mod' : null) };
+      });
+      return { ...summary, roots, fileCountsScope: 'All indexed Mod, dependency and Vanilla roots', scanScope: 'Live source roots scanned during the last refresh; installed dependency/Vanilla index caches are excluded', capabilities: session.connection.capabilities, synchronization: session.synchronization(), server: { ...session.server, info: session.connection.serverInfo },
+        configuration: session.shared ? { settingsFile: session.shared.settings.path, dependenciesSource: session.shared.dependenciesSource, dependencies: session.shared.dependencies.map(row => ({ ...row })), inheritedDefaults, inheritance: 'Omitted settings inherit VS Code; defaults apply only when neither client supplies a value', effective: session.shared.options } : null };
     },
   },
   {
@@ -103,51 +168,53 @@ const specs: Spec[] = [
   {
     name: 'paradoxcode_rules',
     description: 'Search embedded EU4 rules by context, key and/or allowed scope before writing triggers/effects. At least one filter is required. Returns accepted shapes, scope constraints and documentation; limit 1–50.',
-    parameters: { context: string('Rule context such as trigger, effect or type:event'), key: string('Rule key substring'), scope: string('Allowed scope substring such as country or province'), limit: integer('1–50, default 20') },
+    parameters: { ...queryParameters, context: string('Rule context such as trigger, effect or event_body'), key: string('Rule key substring'), scope: string('Allowed scope substring such as country or province'), limit: integer('1–50, default 20') },
     async run(session, args, signal) {
       const filters = Object.fromEntries(['context', 'key', 'scope'].flatMap(key => text(args, key) ? [[key, text(args, key)!]] : []));
       if (!Object.keys(filters).length) throw new Error('Supply at least one of context, key or scope');
-      return session.request('pdc/ruleSearch', { ...filters, limit: number(args, 'limit', 20, 1, 50) }, signal);
+      return queryPage(session, 'pdc/ruleSearch', args, { ...filters, limit: number(args, 'limit', 20, 1, 50) }, signal);
     },
   },
   {
     name: 'paradoxcode_search',
     description: 'Find existing script definitions (events, missions, decisions, tags, scripted triggers/effects) across indexed roots. Query is a name substring of at least two characters. For localisation use paradoxcode_localisation.',
-    parameters: { query: string('Symbol name substring, at least two characters', true), limit: integer('1–100, default 20') },
+    parameters: { ...queryParameters, query: string('Symbol name substring, at least two characters', true), limit: integer('1–100, default 20') },
     async run(session, args, signal) {
       const query = text(args, 'query', true)!;
       if ([...query].length < 2) throw new Error('query must contain at least two characters');
-      return session.request('pdc/symbolSearch', { query, limit: number(args, 'limit', 20, 1, 100) }, signal);
+      return queryPage(session, 'pdc/symbolSearch', args, { query, limit: number(args, 'limit', 20, 1, 100) }, signal);
     },
   },
   {
     name: 'paradoxcode_symbol_references',
     description: 'Find a script definition and its uses by exact name before editing, removing or renaming it. Supply kind to disambiguate. Preserve matched/reason/candidates, total and truncation when assessing impact.',
-    parameters: { name: string('Exact event id, scripted effect name, tag, etc.', true), kind: string('Optional symbol kind, such as event or scripted_effect'), limit: integer('1–100, default 50') },
+    parameters: { ...queryParameters, name: string('Exact event id, scripted effect name, tag, etc.', true), kind: string('Optional symbol kind, such as event or scripted_effect'), limit: integer('1–100, default 50') },
     async run(session, args, signal) {
-      return session.request('pdc/symbolReferences', { name: text(args, 'name', true)!, ...(text(args, 'kind') ? { kind: text(args, 'kind')! } : {}), limit: number(args, 'limit', 50, 1, 100) }, signal);
+      return queryPage(session, 'pdc/symbolReferences', args, { name: text(args, 'name', true)!, ...(text(args, 'kind') ? { kind: text(args, 'kind')! } : {}), limit: number(args, 'limit', 50, 1, 100) }, signal);
     },
   },
   {
     name: 'paradoxcode_localisation',
     description: 'Search indexed localisation by exact key, key prefix/substring, or displayed text. Use exact for known event titles and prefix for a key family. Returns winning definitions, language and values; previews may be bounded by the server.',
-    parameters: { key: string('Localisation key or prefix'), keyMatch: { type: 'string', enum: ['exact', 'prefix', 'substring'], description: 'Default exact' }, text: string('Displayed-value substring'), limit: integer('1–50, default 20') },
+    parameters: { ...queryParameters, key: string('Localisation key or prefix'), keyMatch: { type: 'string', enum: ['exact', 'prefix', 'substring'], description: 'Default exact' }, text: string('Displayed-value substring'), limit: integer('1–50, default 20') },
     async run(session, args, signal) {
       const key = text(args, 'key');
       const value = text(args, 'text');
       if (!key && !value?.trim()) throw new Error('Supply key or non-empty text');
-      return session.request('pdc/localisationSearch', { ...(key ? { key } : {}), ...(value ? { text: value } : {}), keyMatch: text(args, 'keyMatch') ?? 'exact', limit: number(args, 'limit', 20, 1, 50) }, signal);
+      return queryPage(session, 'pdc/localisationSearch', args, { ...(key ? { key } : {}), ...(value ? { text: value } : {}), keyMatch: text(args, 'keyMatch') ?? 'exact', limit: number(args, 'limit', 20, 1, 50) }, signal);
     },
   },
   {
     name: 'paradoxcode_diagnostics',
-    description: 'Validate indexed project files on disk after edits. Includes script and localisation by default, excludes dependency/Vanilla diagnostics. Page using nextOffset until complete; counts describe the returned page only. Diagnostic ranges are LSP 0-based with convenience line 1-based.',
+    description: 'Validate changed Mod files on disk; select files first. Filter by severity/code/line. File pages use nextOffset; diagnostics inside each file page use snapshot and nextDiagnosticOffset. Per-file counts distinguish clean files from omitted details. Ranges are LSP 0-based, line is 1-based.',
     parameters: {
+      ...diagnosticParameters,
       files: { type: 'array', items: { type: 'string' }, description: 'Optional non-empty list of Mod-relative paths; omit for the whole Mod' },
       parser: { type: 'string', enum: ['script', 'localisation'], description: 'Optional zone filter; omit for both' },
       offset: integer('Zero-based file offset, default 0'), limit: integer('Files per page, 1–128, default 16'),
     },
     async run(session, args, signal) {
+      if (args.snapshot !== undefined) return diagnosticsSnapshot(session, 'disk', args);
       let files: string[] | undefined;
       if (args.files !== undefined) {
         if (!Array.isArray(args.files) || !args.files.length || args.files.length > 4096) throw new Error('files must contain 1–4096 logical paths');
@@ -160,14 +227,19 @@ const specs: Spec[] = [
         ...(files ? { files } : {}), ...(text(args, 'parser') ? { parser: text(args, 'parser')! } : {}),
         offset: number(args, 'offset', 0, 0, 10000000), limit: number(args, 'limit', 16, 1, 128),
       }, signal));
-      return { ...result, items: diagnosticFiles(result.items ?? []), pageCounts: countDiagnostics(result.items ?? []) };
+      return diagnosticsSnapshot(session, 'disk', args, result);
     },
   },
   {
     name: 'paradoxcode_validate_text',
-    description: 'Validate 1–16 draft script/localisation files without writing or changing the workspace. Each file is checked independently against the indexed workspace, so new definitions in another draft are not jointly visible. After writing related files, run disk diagnostics. Maximum total text is 16 MiB.',
-    parameters: { files: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: { path: string('Mod-relative logical path, e.g. events/test.txt', true), text: string('Full draft contents', true) } } } },
+    description: 'Jointly validate 1–16 draft script/localisation files against one temporary overlay batch. New cross-file definitions are visible; originals are restored before returning. Never writes files. At most 4 MiB per file and 16 MiB total. Includes per-file counts, filters and diagnostic pagination.',
+    parameters: { ...diagnosticParameters, files: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { path: string('Mod-relative logical path, e.g. events/test.txt', true), text: string('Full draft contents', true) } } } },
     async run(session, args, signal) {
+      if (args.snapshot !== undefined) {
+        const page = diagnosticsSnapshot(session, 'draft', args);
+        const { items, ...summary } = page;
+        return { ...summary, files: items!, basis: 'Joint draft overlay batch; original workspace restored; files were not written' };
+      }
       if (!Array.isArray(args.files) || !args.files.length || args.files.length > 16) throw new Error('Pass 1–16 draft files');
       let bytes = 0;
       const paths = new Set<string>();
@@ -181,27 +253,40 @@ const specs: Spec[] = [
         return { path, text: content };
       });
       if (bytes > 16 * 1024 * 1024) throw new Error('Draft text exceeds the 16 MiB total limit');
-      const result = await session.request('pdc/textDiagnostics', { files }, signal);
-      return { files: diagnosticFiles(result), counts: countDiagnostics(result), basis: 'Each draft checked independently against the indexed workspace; files were not written' };
+      const result = await session.withDrafts(files, signal, () => session.request('pdc/textDiagnostics', { files }, signal));
+      const page = diagnosticsSnapshot(session, 'draft', args, result);
+      const { items, ...summary } = page;
+      return { ...summary, files: items!, basis: 'Joint draft overlay batch; original workspace restored; files were not written' };
     },
   },
   {
     name: 'paradoxcode_document',
     description: 'Inspect an EU4 document: hover explains rules/scopes, completion suggests valid keys/values, definition/references find locations, symbols lists document structure. Optional text analyzes a temporary draft at a Mod-relative path. Input line is 1-based and character is 0-based UTF-16; returned LSP positions are 0-based.',
-    parameters: { ...cursor, action: { type: 'string', enum: ['hover', 'completion', 'definition', 'references', 'symbols'], required: true }, text: string('Optional full draft text; never written'), limit: integer('Completion/reference result limit 1–100, default 50') },
+    parameters: { ...cursor, action: { type: 'string', enum: ['hover', 'completion', 'definition', 'references', 'symbols'], required: true }, text: string('Optional full draft text; never written'), limit: integer('Completion/reference result limit 1–100, default 50'), offset: integer('Completion/reference offset, default 0'), snapshot: string('Snapshot from the first completion/reference page') },
     async run(session, args, signal) {
       const action = text(args, 'action', true)!;
+      const limit = number(args, 'limit', 50, 1, 100), offset = number(args, 'offset', 0, 0, 10000000);
+      const supplied = text(args, 'snapshot');
+      const page = (result: Json, token: string): Json => {
+        const items = action === 'references' ? result : Array.isArray(result) ? result : result && object(result).items;
+        if (!Array.isArray(items)) return result;
+        if (offset > items.length) throw new Error('offset exceeds the result count');
+        return { [action === 'references' ? 'locations' : 'items']: items.slice(offset, offset + limit), total: items.length,
+          snapshot: token, nextOffset: offset + limit < items.length ? offset + limit : null, truncated: offset + limit < items.length,
+          ...(action === 'completion' ? { isIncomplete: !Array.isArray(result) && result !== null ? object(result).isIncomplete ?? false : false } : {}) };
+      };
+      if (supplied) {
+        if (!['completion', 'references'].includes(action)) throw new Error('snapshot is only supported for completion/references');
+        const record = session.results.get(supplied, `document:${session.shared?.fingerprint ?? ''}`);
+        assertSnapshotInput(record.input, args, ['offset', 'limit']);
+        return page(record.value, supplied);
+      }
+      if (offset) throw new Error('Continue with snapshot and nextOffset from the first page');
       const methods: Record<string, string> = { hover: 'textDocument/hover', completion: 'textDocument/completion', definition: 'textDocument/definition', references: 'textDocument/references', symbols: 'textDocument/documentSymbol' };
       return session.withDocument(text(args, 'path', true)!, text(args, 'text'), signal, async (uri, content) => {
         const params: JsonObject = { textDocument: { uri }, ...(action !== 'symbols' ? { position: position(args, content) } : {}), ...(action === 'references' ? { context: { includeDeclaration: true } } : {}) };
         const result = await session.request(methods[action]!, params, signal);
-        const limit = number(args, 'limit', 50, 1, 100);
-        if (action === 'completion') {
-          const items = Array.isArray(result) ? result : (result && object(result).items);
-          if (!Array.isArray(items)) return result;
-          return { items: items.slice(0, limit), total: items.length, truncated: items.length > limit, isIncomplete: !Array.isArray(result) && result !== null ? object(result).isIncomplete ?? false : false };
-        }
-        if (action === 'references' && Array.isArray(result)) return { locations: result.slice(0, limit), total: result.length, truncated: result.length > limit };
+        if (action === 'completion' || action === 'references') return page(result, session.results.save(`document:${session.shared?.fingerprint ?? ''}`, result, args));
         return result;
       });
     },
@@ -292,10 +377,16 @@ export function makeTools(config: Config, pool: WorkspacePool, getWorkspace: (ar
     description: spec.description,
     parameters: { ...spec.parameters, workspace: string('Optional Mod root directory; defaults to plugin config or the calling DSH session cwd') },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { workspace: { type: 'string', required: true }, result: { type: 'json', required: true } } },
+      schema: { type: 'object', additionalProperties: false, properties: { workspace: { type: 'string', required: true }, result: { type: 'json', required: true }, retrieval: { type: 'json' } } },
       render(_args, value) {
-        const output = JSON.stringify(value, null, 2);
-        return [{ type: 'text', text: output.length <= config.maxOutputChars ? output : `Native display truncated (${output.length} characters, budget ${config.maxOutputChars}). Narrow filters/page results, or use PTC to inspect the complete canonical JSON. This prefix is not the complete result:\n${output.slice(0, config.maxOutputChars)}` }];
+        const wrapped = value as JsonObject;
+        if (spec.name === 'paradoxcode_result') {
+          const result = object(wrapped.result!);
+          const { chunk, ...header } = result;
+          return [{ type: 'text', text: `${JSON.stringify(header)}\n${String(chunk)}` }];
+        }
+        const output = JSON.stringify(value);
+        return [{ type: 'text', text: output.length <= config.maxOutputChars ? output : nativeSummary(wrapped, config.maxOutputChars) }];
       },
     },
     async execute(args, exec) {
@@ -305,8 +396,19 @@ export function makeTools(config: Config, pool: WorkspacePool, getWorkspace: (ar
         if (key !== 'workspace' && !Object.hasOwn(spec.parameters, key)) throw new Error(`Unknown parameter: ${key}`);
       }
       const workspace = await getWorkspace(input, exec);
-      if (spec.manage) return pool.configure(workspace, exec.signal, async (base, active) => ({ workspace: base, result: await spec.manage!(base, config, input, active) }));
-      return pool.run(workspace, exec.signal, async session => ({ workspace: session.root, result: await spec.run!(session, input, exec.signal) }));
+      if (spec.name === 'paradoxcode_result') return pool.configure(workspace, exec.signal, async base => ({ workspace: base, result: readStoredResult(pool.resultsFor(base), input, config.maxOutputChars) }));
+      if (spec.manage) return pool.configure(workspace, exec.signal, async (base, active) => {
+        const value: { workspace: string; result: Json; retrieval?: Json } = { workspace: base, result: await spec.manage!(base, config, input, active) };
+        if (JSON.stringify(value).length > config.maxOutputChars) value.retrieval = { tool: 'paradoxcode_result', token: pool.resultsFor(base).save('output', value), offset: 0 };
+        return value;
+      });
+      return pool.run(workspace, exec.signal, async session => {
+        const value: { workspace: string; result: Json; retrieval?: Json } = { workspace: session.root, result: await spec.run!(session, input, exec.signal) };
+        if (spec.name !== 'paradoxcode_result' && JSON.stringify(value).length > config.maxOutputChars) {
+          value.retrieval = { tool: 'paradoxcode_result', token: session.results.save('output', value), offset: 0 };
+        }
+        return value;
+      });
     },
   }));
 }

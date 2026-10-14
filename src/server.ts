@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import type { Config } from './config.js';
@@ -10,6 +10,14 @@ const REPOSITORY = 'danxiaogu520/ParadoxCode';
 const RELEASES = `https://github.com/${REPOSITORY}/releases/download`;
 const VERSION = /^\d+\.\d+\.\d+$/;
 const DIGEST = /^[a-f0-9]{64}$/;
+export const BOOTSTRAP_VERSION = '0.5.2';
+
+function versionParts(version: string): number[] { return version.split('.').map(Number); }
+function compareVersions(a: string, b: string): number {
+  const aa = versionParts(a), bb = versionParts(b);
+  return aa[0]! - bb[0]! || aa[1]! - bb[1]! || aa[2]! - bb[2]!;
+}
+function compatible(version: string): boolean { return VERSION.test(version) && compareVersions(version, BOOTSTRAP_VERSION) >= 0; }
 
 export interface ServerResolution {
   path: string;
@@ -61,7 +69,8 @@ async function fetchBytes(url: string, maximum: number, signal: AbortSignal, fet
   const parsed = downloadUrl(url);
   let response: Response;
   try {
-    response = await fetcher(parsed, { signal, redirect: 'manual', headers: { 'User-Agent': 'dsh-eu4-modding', Accept: parsed.hostname === 'api.github.com' ? 'application/vnd.github+json' : 'application/octet-stream' } });
+    const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+    response = await fetcher(parsed, { signal, redirect: 'manual', headers: { 'User-Agent': 'dsh-eu4-modding', Accept: parsed.hostname === 'api.github.com' ? 'application/vnd.github+json' : 'application/octet-stream', ...(parsed.hostname === 'api.github.com' && token ? { Authorization: `Bearer ${token}` } : {}) } });
   } catch (error) {
     checkAbort(signal);
     throw new DownloadError(`Cannot download ${parsed.pathname}: ${error instanceof Error ? error.message : String(error)}`, true);
@@ -145,6 +154,43 @@ async function cachedLatest(root: string, artifact: ServerArtifact): Promise<Ser
   }
 }
 
+async function cachedFallback(root: string, artifact: ServerArtifact): Promise<ServerResolution | undefined> {
+  let rows;
+  try { rows = await readdir(root, { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  const versions = rows.filter(row => row.isDirectory() && row.name.endsWith(`-${artifact.target}`))
+    .map(row => row.name.slice(0, -artifact.target.length - 1)).filter(compatible).sort((a, b) => compareVersions(b, a));
+  for (const version of versions) {
+    const cached = await cachedServer(root, version, artifact);
+    if (cached) return cached;
+  }
+  return undefined;
+}
+
+async function webLatest(signal: AbortSignal, fetcher: typeof globalThis.fetch): Promise<string> {
+  let url = `https://github.com/${REPOSITORY}/releases/latest`;
+  for (let redirects = 0; redirects < 6; redirects++) {
+    checkAbort(signal);
+    const parsed = downloadUrl(url);
+    if (parsed.hostname !== 'github.com' || !parsed.pathname.startsWith(`/${REPOSITORY}/releases/`)) throw new DownloadError('Invalid GitHub latest release redirect');
+    let response: Response;
+    try { response = await fetcher(parsed, { signal, redirect: 'manual', headers: { 'User-Agent': 'dsh-eu4-modding' } }); }
+    catch { checkAbort(signal); throw new DownloadError('Cannot discover the release through GitHub web redirects', true); }
+    await response.body?.cancel();
+    const location = response.headers.get('location');
+    if (response.status >= 300 && response.status < 400 && location) {
+      url = new URL(location, parsed).href;
+      const target = downloadUrl(url);
+      const match = new RegExp(`^/${REPOSITORY}/releases/tag/v?(\\d+\\.\\d+\\.\\d+)$`).exec(target.pathname);
+      if (target.hostname === 'github.com' && match && compatible(match[1]!)) return match[1]!;
+      continue;
+    }
+    if (!response.ok) throw new DownloadError(`GitHub release discovery failed with HTTP ${response.status}`, response.status === 403 || response.status === 429 || response.status >= 500);
+    throw new DownloadError('GitHub did not return a stable release redirect', true);
+  }
+  throw new DownloadError('Too many GitHub latest release redirects');
+}
+
 async function install(root: string, version: string, artifact: ServerArtifact, archive: Buffer, archiveSha256: string, signal: AbortSignal): Promise<ServerResolution> {
   if (sha256(archive) !== archiveSha256) throw new Error('ParadoxCode archive SHA-256 mismatch; downloaded bytes will not be executed');
   // Another profile may have completed this immutable release while we were downloading.
@@ -225,11 +271,35 @@ export async function resolveServer(config: Config, signal?: AbortSignal, option
   } catch (error) {
     checkAbort(signal);
     const timedOut = deadline.aborted;
-    if (latest && (timedOut || error instanceof DownloadError && error.unavailable)) {
-      const cached = await cachedLatest(root, artifact);
+    const unavailable = error instanceof DownloadError && error.unavailable;
+    const deadlineFailure = timedOut && (unavailable || error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name));
+    // An elapsed deadline must never turn an integrity/protocol failure into a downgrade.
+    if (latest && (deadlineFailure || unavailable)) {
+      const pointer = await cachedLatest(root, artifact);
+      const cached = pointer && compatible(pointer.version!) ? pointer : await cachedFallback(root, artifact);
       if (cached) return { ...cached, warning: `Could not check/download the latest release; using verified cached ParadoxCode ${cached.version}. ${timedOut ? 'Download timed out.' : String(error)}` };
+      if (!timedOut) {
+        let version: string;
+        let discovery = 'GitHub web redirect';
+        try { version = await webLatest(active, fetcher); }
+        catch (fallbackError) {
+          checkAbort(signal);
+          if (deadline.aborted && fallbackError instanceof Error && ['AbortError', 'TimeoutError'].includes(fallbackError.name)) throw new Error(`ParadoxCode download timed out after ${config.downloadTimeoutMs} ms. Retry or configure serverPath with a local executable.`);
+          if (!(fallbackError instanceof DownloadError && fallbackError.unavailable)) throw fallbackError;
+          version = BOOTSTRAP_VERSION;
+          discovery = 'bundled bootstrap version';
+        }
+        try {
+          const fallback = await resolveServer({ ...config, serverVersion: version }, active, options);
+          return { ...fallback, warning: `GitHub API unavailable; using verified ParadoxCode ${version} from ${discovery}. Latest status is unconfirmed. ${String(error)}` };
+        } catch (fallbackError) {
+          checkAbort(signal);
+          if (deadline.aborted) throw new Error(`ParadoxCode download timed out after ${config.downloadTimeoutMs} ms. Retry or configure serverPath with a local executable.`);
+          throw fallbackError;
+        }
+      }
     }
-    if (timedOut) throw new Error(`ParadoxCode download timed out after ${config.downloadTimeoutMs} ms. Retry or configure serverPath with a local executable.`);
+    if (deadlineFailure) throw new Error(`ParadoxCode download timed out after ${config.downloadTimeoutMs} ms. Retry or configure serverPath with a local executable.`);
     throw error;
   }
 }

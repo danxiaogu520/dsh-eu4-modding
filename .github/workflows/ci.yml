@@ -2,6 +2,32 @@ name: CI
 on: [push, pull_request]
 jobs:
   test:
+    strategy:
+      matrix:
+        node: ['22', '24']
+        manager: [npm, pnpm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: pnpm/action-setup@v4
+        if: matrix.manager == 'pnpm'
+        with:
+          version: 10.18.0
+      - run: npm ci
+        if: matrix.manager == 'npm'
+      - run: pnpm install --frozen-lockfile --config.node-linker=isolated
+        if: matrix.manager == 'pnpm'
+      - run: npm run check
+      - run: npm test
+      - run: npm pack --dry-run
+      - run: npm run check:package
+      - run: npm run docs:agents
+      - run: git diff --exit-code -- AGENTS.md examples/AGENTS.md
+  server:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -10,6 +36,23 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - run: npm run check
-      - run: npm test
-      - run: npm pack --dry-run
+      - name: Obtain the exact upstream source
+        run: |
+          git init "$RUNNER_TEMP/paradoxcode"
+          git -C "$RUNNER_TEMP/paradoxcode" fetch --depth 1 https://github.com/danxiaogu520/ParadoxCode.git eae304594f5c987fa9723d12f46854e2861449ca
+          git -C "$RUNNER_TEMP/paradoxcode" checkout --detach FETCH_HEAD
+      - name: Apply server fixes
+        run: git -C "$RUNNER_TEMP/paradoxcode" apply "$GITHUB_WORKSPACE/patches/paradoxcode-0.5.3.patch"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ runner.temp }}/paradoxcode -> target
+      - name: Server regressions and executable
+        working-directory: ${{ runner.temp }}/paradoxcode
+        run: |
+          cargo test --locked -p ide -p pdc --lib
+          cargo build --locked -p pdc --bin paradoxcode --profile test
+      - name: Real server integration
+        env:
+          PARADOXCODE_TEST_SERVER: ${{ runner.temp }}/paradoxcode/target/debug/paradoxcode
+        run: npm run test:integration

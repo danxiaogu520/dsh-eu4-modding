@@ -22,6 +22,89 @@ country_event = {
 `;
 const localisation = '\uFEFFl_english:\n dsh_demo.1.t:0 "Demo title"\n dsh_demo.1.d:0 "Demo description"\n dsh_demo.1.a:0 "Demo option"\n';
 
+test('real ParadoxCode: related drafts resolve together and leave no definitions or bytes behind', { skip: !serverPath, timeout: 360000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-real-joint-'));
+  await mkdir(join(root, 'localisation'), { recursive: true });
+  const original = '\uFEFFl_english:\n joint_old:0 "Old"\n';
+  await writeFile(join(root, 'localisation/joint_l_english.yml'), original);
+  const h = await harness({ serverPath, workspace: root, vanillaMode: 'disabled', autoRefresh: false });
+  t.after(async () => { await h.dispose(); await rm(root, { recursive: true, force: true }); });
+  const source = 'namespace = joint\ncountry_event = { id = joint.1 title = joint.t desc = joint.d is_triggered_only = yes option = { name = joint.a joint_effect = yes } }';
+  const files = [
+    { path: 'events/joint.txt', text: source },
+    { path: 'common/scripted_effects/joint.txt', text: 'joint_effect = { add_prestige = 1 }\n' },
+    { path: 'localisation/joint_l_english.yml', text: '\uFEFFl_english:\n joint.t:0 "Title"\n joint.d:0 "Description"\n joint.a:0 "Option"\n' },
+  ];
+  const result = await h.call('paradoxcode_validate_text', { files });
+  assert.equal(result.isError, false, JSON.stringify(result));
+  assert.equal(result.value.result.counts.errors, 0, JSON.stringify(result.value.result));
+  const missing = await h.call('paradoxcode_validate_text', { files: [files[0], files[1], { ...files[2], text: '\uFEFFl_english:\n joint.t:0 "Title"\n joint.a:0 "Option"\n' }] });
+  assert.equal(missing.isError, false, JSON.stringify(missing));
+  assert.ok(missing.value.result.files[0].diagnostics.some(d => d.code === 'UnknownLocalisationKey' && d.message.includes('joint.d')));
+  const after = await h.call('paradoxcode_localisation', { key: 'joint.t' });
+  assert.equal(after.value.result.hits.length, 0);
+  const symbols = await h.call('paradoxcode_search', { query: 'joint_effect' });
+  assert.equal(symbols.value.result.symbols.length, 0);
+  assert.equal(await readFile(join(root, 'localisation/joint_l_english.yml'), 'utf8'), original);
+});
+
+test('real ParadoxCode: server search pages and document references can be exhausted without loss', { skip: !serverPath || serverPath === 'auto', timeout: 360000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-real-pages-'));
+  for (const path of ['common/scripted_effects', 'events', 'common/custom_gui']) await mkdir(join(root, path), { recursive: true });
+  const definitions = Array.from({ length: 60 }, (_, n) => `pagination_probe_effect_${n} = { add_prestige = 1 }`).join('\n');
+  await writeFile(join(root, 'common/scripted_effects/pages.txt'), definitions);
+  await writeFile(join(root, 'common/custom_gui/empty.txt'), '');
+  await writeFile(join(root, 'events/outside_profile.md'), 'Notes');
+  await writeFile(join(root, 'events/caller.txt'), `country_event = { id = pagination_probe.1 hidden = yes immediate = { ${'pagination_probe_effect_0 = yes '.repeat(121)} } }`);
+  const h = await harness({ serverPath, workspace: root, vanillaMode: 'disabled', autoRefresh: false });
+  t.after(async () => { await h.dispose(); await rm(root, { recursive: true, force: true }); });
+  const orientation = await h.call('paradoxcode_workspace');
+  assert.equal(orientation.isError, false, JSON.stringify(orientation));
+  const names = [];
+  let continuation = {};
+  for (;;) {
+    const response = await h.call('paradoxcode_query', { tab: 'definitions', query: 'pagination_probe_effect', status: 'active', ...continuation });
+    assert.equal(response.isError, false, JSON.stringify(response));
+    const page = response.value.result;
+    names.push(...page.groups.flatMap(group => group.versions.map(version => version.name)));
+    if (page.nextOffset === null) break;
+    continuation = { offset: page.nextOffset, revision: page.revision, snapshot: page.snapshot };
+  }
+  assert.equal(names.length, 60);
+  assert.equal(new Set(names).size, 60);
+  const cursor = { action: 'references', path: 'common/scripted_effects/pages.txt', line: 1, character: 2, limit: 17 };
+  let response = await h.call('paradoxcode_document', cursor);
+  assert.equal(response.isError, false, JSON.stringify(response));
+  const expected = response.value.result.total;
+  assert.equal(expected, 122);
+  const references = [];
+  for (;;) {
+    const page = response.value.result;
+    references.push(...page.locations);
+    if (page.nextOffset === null) break;
+    response = await h.call('paradoxcode_document', { ...cursor, snapshot: page.snapshot, offset: page.nextOffset });
+    assert.equal(response.isError, false, JSON.stringify(response));
+  }
+  assert.equal(references.length, expected);
+  assert.equal(new Set(references.map(ref => JSON.stringify(ref))).size, expected);
+  if (orientation.value.result.capabilities.experimental?.pdcQueryPagination) {
+    const hits = [];
+    let next = {};
+    for (;;) {
+      const response = await h.call('paradoxcode_search', { query: 'pagination_probe_effect', limit: 17, ...next });
+      assert.equal(response.isError, false, JSON.stringify(response));
+      const page = response.value.result;
+      hits.push(...page.symbols);
+      if (page.nextOffset === null) break;
+      next = { offset: page.nextOffset, revision: page.revision };
+    }
+    assert.equal(hits.length, 60);
+    const disk = await h.call('paradoxcode_diagnostics', { files: ['events/caller.txt'] });
+    assert.equal(disk.value.result.items[0].diagnostics.some(d => d.code === 'Cardinality' && d.message.includes('option')), false);
+    assert.ok(orientation.value.result.scan.excludedEntries.some(entry => entry.path.endsWith('events/outside_profile.md')));
+  }
+});
+
 test('real ParadoxCode: full agentic query, draft, edit, refresh and review workflow', { skip: !serverPath && 'Set PARADOXCODE_TEST_SERVER to auto or a standalone paradoxcode binary', timeout: serverPath === 'auto' ? 660000 : 360000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-real-pdc-'));
   for (const dir of ['common/scripted_effects', 'events', 'localisation', 'missions']) await mkdir(join(root, dir), { recursive: true });

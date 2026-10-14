@@ -3,3 +3,4 @@ lib/
 *.tgz
 *.tgz.sha256
 coverage/
+artifacts/

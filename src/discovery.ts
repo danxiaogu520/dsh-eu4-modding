@@ -41,7 +41,7 @@ export async function discoverModRoot(cwd: string, signal?: AbortSignal): Promis
   }
   const children = (await entries(current)).filter(file => file.isDirectory() && !file.name.startsWith('.') && !['node_modules', 'target'].includes(file.name));
   // Large unrelated folders should not trigger a broad filesystem search.
-  if (children.length > 64) return current;
+  if (children.length > 64) throw new Error(`Automatic Mod discovery stopped: ${current} contains ${children.length} child directories (limit 64). Select the Mod explicitly with workspace.`);
   const candidates: string[] = [];
   for (const child of children) {
     checkAbort(signal);

@@ -30,7 +30,8 @@ const languagesSchema = z.array(z.string());
 dependenciesSchema.meta.default = undefined;
 languagesSchema.meta.default = undefined;
 
-export const Config = z.object({
+// Keep declaration emission independent of schemastery's transitive implementation types.
+export const Config: z<Partial<Config>, Partial<Config>> = z.object({
   serverPath: z.string().default('auto').description('auto downloads a verified GitHub release; otherwise use a local executable path or PATH name (not paradoxcode-mcp).'),
   serverVersion: z.string().default('latest').description('Latest stable GitHub release, or a fixed version such as 0.5.2. Only used with serverPath: auto.'),
   serverCacheDirectory: z.string().default('').description('Managed server cache directory. Empty uses the OS user cache directory.'),
@@ -38,14 +39,19 @@ export const Config = z.object({
   workspace: z.string().default('').description('Mod root. Empty detects the Mod from the calling session directory, its ancestors, or a single child Mod. Each tool can override it.'),
   timeoutMs: z.number().min(1000).max(600000).default(300000).description('LSP request and initial indexing deadline in milliseconds; allows first-time game indexing.'),
   maxWorkspaces: z.number().min(1).max(16).default(3).description('Maximum language server processes; idle sessions are evicted first.'),
-  maxOutputChars: z.number().min(1024).max(262144).default(24000).description('Native tool text budget. PTC canonical JSON retains the complete result.'),
+  maxOutputChars: z.number().min(1024).max(262144).default(24000).description('Compact native display budget. Oversized results return summaries and a paradoxcode_result retrieval token; PTC retains the complete JSON.'),
   vanillaMode: z.union(['auto', 'cacheOnly', 'disabled']).description('Defaults to automatic game discovery; reuses the VS Code workspace setting unless explicitly overridden here.'),
-  gameDirectory: z.string().description('Optional EU4 installation root; overrides the shared VS Code workspace setting.'),
-  vanillaIndexCache: z.string().description('Optional Vanilla index cache; overrides the shared VS Code workspace setting.'),
-  dependencies: dependenciesSchema.description('Optional override of the shared paradoxcode.dependencies list, in low-to-high priority order. An explicit [] clears dependencies.'),
+  gameDirectory: z.string().description('Inherits the VS Code workspace setting; otherwise empty. An explicit value overrides the shared setting.'),
+  vanillaIndexCache: z.string().description('Inherits the VS Code workspace setting; otherwise empty. An explicit value overrides the shared setting.'),
+  dependencies: dependenciesSchema.description('Inherits shared paradoxcode.dependencies, otherwise []. Explicit values override it in low-to-high priority order; [] clears dependencies.'),
   preferredLocalisationLanguages: languagesSchema.description('Optional override of shared localisation languages; defaults to English.'),
-  autoRefresh: z.boolean().default(true).description('Watch the Mod for external edits and refresh after successful DSH editing/shell tools.'),
+  autoRefresh: z.boolean().default(true).description('Watch external Mod edits and compare declared paths before/after tools; refresh only owning workspaces, using file notifications when possible.'),
 });
+
+export const inheritedDefaults: JsonObject = {
+  vanillaMode: 'auto', gameDirectory: '', vanillaIndexCache: '', dependencies: [],
+  preferredLocalisationLanguages: ['english'],
+};
 
 export function normalizeConfig(input: Partial<Config> = {}): Config {
   const parsed = Config(input) as Partial<Config>;

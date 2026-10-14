@@ -69,3 +69,16 @@ test('pre-cancelled initialization does not leave a child alive', async t => {
   await assert.rejects(client.initialize(AbortSignal.abort()), { name: 'AbortError' });
   assert.throws(() => process.kill(pid, 0), /ESRCH/);
 });
+
+test('cooperative cancellation drains the response and preserves the indexed process', async t => {
+  const client = await fixture(t, 'cooperative');
+  await client.initialize();
+  const pid = client.pid;
+  const controller = new AbortController();
+  const pending = client.request('test/hang', {}, controller.signal);
+  controller.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(client.alive, true);
+  assert.equal(client.pid, pid);
+  assert.equal((await client.request('test/echo')).value, '中文 😀');
+});
