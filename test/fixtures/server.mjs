@@ -34,7 +34,7 @@ function handle(message) {
       return;
     }
     send({ jsonrpc: '2.0', id: 'client-request', method: 'window/workDoneProgress/create', params: { token: 1 } });
-    send({ jsonrpc: '2.0', id: message.id, result: { capabilities: { hoverProvider: true }, serverInfo: { name: 'pdc-fixture', version: '0.5.2' } } });
+    send({ jsonrpc: '2.0', id: message.id, result: { capabilities: { hoverProvider: true, experimental: { pdcWholeFileTranscode: !mode.startsWith('legacy-transcode-') } }, serverInfo: { name: 'pdc-fixture', version: '0.5.2' } } });
   } else if (message.method === 'shutdown') {
     send({ jsonrpc: '2.0', id: message.id, result: null });
   } else if (message.method === 'test/hang') {

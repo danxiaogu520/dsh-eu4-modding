@@ -181,22 +181,29 @@ test('real ParadoxCode: full agentic query, draft, edit, refresh and review work
 
   const mission = await call('paradoxcode_mission_preview', { path: 'missions/demo.txt', text: 'demo_tree = { slot = 1 a1 = { position = 1 icon = mission_alpha } a2 = { position = 2 required_missions = { a1 } } }' });
   assert.ok(mission);
-  const encoded = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: 'l_english:\n key:0 "中文"\n' });
-  assert.equal(encoded.applied, false);
-  assert.ok(encoded.bytes && !encoded.refused, JSON.stringify(encoded));
-  const decoded = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'localisation/chinese_l_english.yml', bytesHex: encoded.bytes });
-  assert.ok(decoded.text.includes('中文'));
-  // 0.5.2 manual transcoding preserves comments and existing escape triples.
-  const readable = 'l_english:\n # 中文 comment\n key:0 "中文"\n';
-  const quoted = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: readable, preserveEscaped: true });
-  assert.ok(quoted.bytes && !quoted.refused, JSON.stringify(quoted));
-  const partial = Buffer.from(quoted.bytes, 'hex').toString('utf8');
-  assert.ok(partial.includes('# 中文 comment'));
-  assert.ok(!partial.includes('key:0 "中文"'));
-  const preservedEscapes = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: partial, preserveEscaped: true });
-  assert.equal(preservedEscapes.bytes, quoted.bytes);
-  const decodedQuoted = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'localisation/chinese_l_english.yml', bytesHex: quoted.bytes, quotedOnly: true });
-  assert.equal(decodedQuoted.text, readable);
+  if (summary.capabilities.experimental?.pdcWholeFileTranscode) {
+    const readable = '\uFEFFl_english:\n # 中文注释\n 中文键:0 "中文内容"\n';
+    const encoded = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: readable });
+    assert.equal(encoded.applied, false);
+    assert.ok(encoded.bytes && !encoded.refused, JSON.stringify(encoded));
+    const escapedText = Buffer.from(encoded.bytes, 'hex').toString('utf8');
+    assert.ok(!escapedText.includes('中文'), 'comments, identifiers and values all convert');
+    const again = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: escapedText });
+    assert.equal(again.bytes, encoded.bytes, 'existing triples never double-encode');
+    const decoded = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'localisation/chinese_l_english.yml', bytesHex: encoded.bytes });
+    assert.equal(Buffer.from(decoded.bytes, 'hex').toString('utf8'), readable);
+    const script = '# 中文注释\n中文标识 = 中文值\nname = "中文内容"\n';
+    const encodedScript = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'events/chinese.txt', text: script });
+    const decodedScript = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'events/chinese.txt', bytesHex: encodedScript.bytes });
+    assert.equal(decodedScript.text, script);
+    const refused = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'events/chinese.txt', text: '# 😀\nname = "x"\n' });
+    assert.equal(refused.refused, 'unencodable');
+    assert.equal(refused.bytes, undefined);
+  } else {
+    const refused = await h.call('paradoxcode_transcode_preview', { action: 'encode', path: 'events/chinese.txt', text: '# 中文注释\n' }, undefined, agent);
+    assert.equal(refused.isError, true, 'old quote-only servers must not perform conversions');
+    assert.match(JSON.stringify(refused), /updated ParadoxCode server/);
+  }
 
   // Explicit refresh covers shell/outside-editor edits and discovers new files.
   await writeFile(join(root, 'common/scripted_effects/added.txt'), 'dsh_added_effect = { add_prestige = 1 }\n');

@@ -328,17 +328,19 @@ const specs: Spec[] = [
   },
   {
     name: 'paradoxcode_transcode_preview',
-    description: 'Preview EU4 Chinese localisation/script encoding or decoding using ParadoxCode profiles. Never writes bytes. Decode accepts bytesHex or a Mod-relative disk file; encode requires readable text. Returns encoded bytes as hex and preserves refusal/damage metadata. Check eligible/refused/broken/damagedAt before applying any conversion.',
-    parameters: { path: string('Mod-relative target path deciding the encoding profile', true), action: { type: 'string', enum: ['decode', 'encode'], required: true }, text: string('Readable UTF-8 text to encode'), bytesHex: string('Optional even-length hexadecimal source bytes to decode'), quotedOnly: { type: 'boolean', description: 'Decode only quoted escape triples; default false' }, preserveEscaped: { type: 'boolean', description: 'Preserve existing quoted escapes while encoding; default false' } },
+    description: 'Preview whole-file EU4 Chinese localisation/script encoding or decoding, including comments, identifiers and strings. Requires a server advertising pdcWholeFileTranscode. Never writes bytes. Decode accepts bytesHex or a Mod-relative disk file; encode requires readable text. Valid existing escape triples are preserved. Check eligible/refused/broken/damagedAt before applying any conversion.',
+    parameters: { path: string('Mod-relative target path deciding the encoding profile', true), action: { type: 'string', enum: ['decode', 'encode'], required: true }, text: string('Complete readable UTF-8 file contents to encode'), bytesHex: string('Optional even-length hexadecimal source bytes to decode') },
     async run(session, args, signal) {
+      if (args.quotedOnly !== undefined || args.preserveEscaped !== undefined) throw new Error('Quote-only transcoding options have been removed; conversion always covers the entire file');
+      if (object(session.connection.capabilities.experimental ?? {}).pdcWholeFileTranscode !== true) throw new Error('Whole-file transcoding requires an updated ParadoxCode server advertising pdcWholeFileTranscode; update the server or configure serverPath');
       const path = resolve(session.root, logicalPath(text(args, 'path', true)!));
       const action = text(args, 'action', true)!;
       let bytes: Buffer;
       if (action === 'encode') {
-        if (args.bytesHex !== undefined || args.quotedOnly !== undefined) throw new Error('encode accepts text and preserveEscaped, not bytesHex or quotedOnly');
+        if (args.bytesHex !== undefined) throw new Error('encode accepts text, not bytesHex');
         bytes = Buffer.from(text(args, 'text', true)!, 'utf8');
       } else {
-        if (args.text !== undefined || args.preserveEscaped !== undefined) throw new Error('decode accepts bytesHex and quotedOnly, not text or preserveEscaped');
+        if (args.text !== undefined) throw new Error('decode accepts bytesHex, not text');
         const hex = text(args, 'bytesHex');
         if (hex !== undefined) {
           if (!/^(?:[a-f\d]{2})*$/i.test(hex) || hex.length > 32 * 1024 * 1024) throw new Error('bytesHex must be even-length hexadecimal of at most 16 MiB');
@@ -353,7 +355,7 @@ const specs: Spec[] = [
       }
       if (bytes.length > 16 * 1024 * 1024) throw new Error('Transcode input exceeds 16 MiB');
       const result = object(await session.request(action === 'encode' ? 'pdc/transcodeEncode' : 'pdc/transcodeDecode', {
-        path, bytes: bytes.toString('hex'), ...(action === 'encode' ? { preserveEscaped: args.preserveEscaped ?? false } : { quotedOnly: args.quotedOnly ?? false }),
+        path, bytes: bytes.toString('hex'),
       }, signal));
       if (action === 'decode' && typeof result.bytes === 'string') {
         try { result.text = new TextDecoder('utf8', { fatal: true }).decode(Buffer.from(result.bytes, 'hex')); } catch { /* retain exact bytes and backend damage metadata */ }

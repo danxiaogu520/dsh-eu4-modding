@@ -1,0 +1,3542 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c03a153..da66180 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Manual encode/decode and experimental transparent saves now convert the entire file,
++  including comments, identifiers and strings. Valid existing triples and readable runs
++  remain idempotent; damaged sequences and unencodable input refuse the complete operation.
++- Removed quote-only transcoding APIs and protocol options. Updated clients require the
++  `pdcWholeFileTranscode` server capability; older servers must be upgraded before conversion.
++
+ ## [0.5.2] - 2026-10-14
+ 
+ ### Added
+diff --git a/crates/engine/src/host.rs b/crates/engine/src/host.rs
+index 8e1fcd2..beff211 100644
+--- a/crates/engine/src/host.rs
++++ b/crates/engine/src/host.rs
+@@ -977,6 +977,7 @@ impl AnalysisHost {
+             if self.installed_caches.contains(&root.id) {
+                 continue;
+             }
++            report.scanned_roots.push(root.id);
+             let mut paths = Vec::new();
+             collect_whitelisted_files(
+                 &root.path,
+@@ -994,6 +995,13 @@ impl AnalysisHost {
+                 let Some((category_id, category_parser, category_resolution)) =
+                     self.active_category(&logical)
+                 else {
++                    vfs::scan::record_scan_exclusion(
++                        &mut report,
++                        limits,
++                        vfs::WorkspaceScanIssueKind::Unclassified,
++                        physical.as_path().to_path_buf(),
++                        "no active rule category classifies this file".to_owned(),
++                    );
+                     continue;
+                 };
+                 let source_file = SourceFile {
+diff --git a/crates/ide/src/ir_semantic.rs b/crates/ide/src/ir_semantic.rs
+index 0e1fcc7..5d52e83 100644
+--- a/crates/ide/src/ir_semantic.rs
++++ b/crates/ide/src/ir_semantic.rs
+@@ -1298,6 +1298,31 @@ fn schema_diagnostics_at_depth(
+             diagnostics.push(diagnostic);
+         }
+     }
++    let hidden_event_bodies = hir
++        .properties()
++        .iter()
++        .filter(|parent| {
++            snapshot.rules().game_id() == "eu4"
++                && parent.top_level
++                && (parent.key.eq_ignore_ascii_case("country_event")
++                    || parent.key.eq_ignore_ascii_case("province_event"))
++        })
++        .filter_map(|parent| {
++            let body = parent.value_range?;
++            hir.properties_in_range(parent.range)
++                .any(|child| {
++                    child.path.len() == parent.path.len() + 1
++                        && child.path.starts_with(&parent.path)
++                        && child.key.eq_ignore_ascii_case("hidden")
++                        && child.operator.as_deref() == Some("=")
++                        && child
++                            .scalar
++                            .as_ref()
++                            .is_some_and(|scalar| scalar.value.eq_ignore_ascii_case("yes"))
++                })
++                .then_some(body)
++        })
++        .collect::<std::collections::BTreeSet<_>>();
+     for fact in hir.schema_facts() {
+         if hir.overload_facts().iter().any(|overload| {
+             overload.validation != hir::analysis::Validation::Valid
+@@ -1376,11 +1401,18 @@ fn schema_diagnostics_at_depth(
+             if applicable.is_empty() {
+                 continue;
+             }
+-            let min = applicable
+-                .iter()
+-                .map(|id| ir.field(*id).card.min)
+-                .max()
+-                .unwrap_or(0);
++            let hidden_event_option = ir.strings.resolve(schema.name) == "event_body"
++                && matcher_key_name(ir, *key) == "option"
++                && hidden_event_bodies.contains(&fact.range);
++            let min = if hidden_event_option {
++                0
++            } else {
++                applicable
++                    .iter()
++                    .map(|id| ir.field(*id).card.min)
++                    .max()
++                    .unwrap_or(0)
++            };
+             let max = if applicable.iter().any(|id| ir.field(*id).card.max.is_none()) {
+                 None
+             } else {
+diff --git a/crates/ide/src/lib.rs b/crates/ide/src/lib.rs
+index bfcd957..d1f5ce2 100644
+--- a/crates/ide/src/lib.rs
++++ b/crates/ide/src/lib.rs
+@@ -43,8 +43,8 @@ pub use hover_card::{
+ pub use inlay::{MAX_SCOPE_INLAY_HINTS, scope_inlay_hints_with_cancellation};
+ pub use localisation::{
+     LocalisationKeyMatch, LocalisationSearchHit, LocalisationSearchResult,
+-    localisation_search_with_cancellation, scripted_localisation_names,
+-    scripted_localisation_names_with_cancellation,
++    localisation_search_page_with_cancellation, localisation_search_with_cancellation,
++    scripted_localisation_names, scripted_localisation_names_with_cancellation,
+ };
+ pub use navigation::{
+     definition, definition_with_cancellation, document_symbols, document_symbols_with_cancellation,
+diff --git a/crates/ide/src/localisation.rs b/crates/ide/src/localisation.rs
+index d726c51..64658e6 100644
+--- a/crates/ide/src/localisation.rs
++++ b/crates/ide/src/localisation.rs
+@@ -205,6 +205,28 @@ pub fn localisation_search_with_cancellation(
+     limit: usize,
+     cancellation: &CancellationToken,
+ ) -> Result<LocalisationSearchResult, Cancelled> {
++    localisation_search_page_with_cancellation(
++        snapshot,
++        key,
++        value,
++        key_match,
++        0,
++        limit,
++        cancellation,
++    )
++}
++
++/// Searches a deterministic localisation page without materializing the preceding hits.
++pub fn localisation_search_page_with_cancellation(
++    snapshot: &AnalysisSnapshot,
++    key: Option<&str>,
++    value: Option<&str>,
++    key_match: LocalisationKeyMatch,
++    offset: usize,
++    limit: usize,
++    cancellation: &CancellationToken,
++) -> Result<LocalisationSearchResult, Cancelled> {
++    let mut matched = 0usize;
+     let value_query = value.map(str::to_ascii_lowercase);
+     let mut hits = Vec::new();
+     let mut seen_keys = BTreeSet::new();
+@@ -242,6 +264,10 @@ pub fn localisation_search_with_cancellation(
+                 continue;
+             }
+         }
++        matched += 1;
++        if matched <= offset {
++            continue;
++        }
+         if hits.len() == limit {
+             truncated = true;
+             break;
+diff --git a/crates/ide/src/tests/ir.rs b/crates/ide/src/tests/ir.rs
+index e5c5709..63a2470 100644
+--- a/crates/ide/src/tests/ir.rs
++++ b/crates/ide/src/tests/ir.rs
+@@ -3688,3 +3688,46 @@ fn template_value_rejections_preserve_rule_warning_severity_and_the_actual_value
+         "{advisory:?}"
+     );
+ }
++
++#[test]
++fn hidden_events_do_not_require_options_but_visible_events_do() {
++    for kind in ["country_event", "province_event"] {
++        for (body, required) in [
++            ("hidden = yes immediate = { }", false),
++            ("hidden = yes trigger = { always = no }", false),
++            ("hidden = no", true),
++            ("", true),
++            ("trigger = { always = no }", true),
++            ("immediate = { hidden_effect = { log = hidden } }", true),
++        ] {
++            let mut host = host();
++            let source = format!("{kind} = {{ id = hidden_probe.1 {body} }}");
++            let id = open(&mut host, "events/hidden_probe.txt", &source);
++            let results = diagnostics(&host.snapshot(), &id);
++            assert_eq!(
++                results
++                    .iter()
++                    .any(|d| d.code == DiagnosticCode::Cardinality && d.message.contains("option")),
++                required,
++                "{source}: {results:?}"
++            );
++        }
++    }
++    let mut host = host();
++    let id = open(
++        &mut host,
++        "events/hidden_invalid.txt",
++        "country_event = { hidden = yes immediate = { add_prestige = wrong } }",
++    );
++    let results = diagnostics(&host.snapshot(), &id);
++    assert!(
++        results
++            .iter()
++            .any(|d| d.code == DiagnosticCode::Cardinality && d.message.contains("id"))
++    );
++    assert!(
++        results
++            .iter()
++            .any(|d| d.code == DiagnosticCode::InvalidValue)
++    );
++}
+diff --git a/crates/ide/src/tests/transcode.rs b/crates/ide/src/tests/transcode.rs
+index 02d0554..d28c208 100644
+--- a/crates/ide/src/tests/transcode.rs
++++ b/crates/ide/src/tests/transcode.rs
+@@ -133,8 +133,8 @@ fn open_script(host: &mut AnalysisHost, name: &str, text: String) -> DocumentId
+ }
+ 
+ #[test]
+-fn scoped_shaped_text_is_not_mixed_encoding() {
+-    // A scoped file's char layer: one escaped string, one readable string, a
++fn mixed_whole_file_text_is_not_an_encoding_error() {
++    // A mixed file's char layer: one escaped string, one readable string, a
+     // readable comment. Escape markers sit only inside the quoted span, so no
+     // mixed-encoding error, no orphan warnings, nothing to fix.
+     let escaped = transcode::encode_text(
+@@ -145,41 +145,46 @@ fn scoped_shaped_text_is_not_mixed_encoding() {
+     let text =
+         format!("# \u{6CE8}\u{91CA}\r\nname = \"{escaped}\"\r\ntitle = \"\u{5E1D}\u{56FD}\"\r\n");
+     let mut host = eu4_host(game::eu4::runtime_rules().expect("first-party rules"));
+-    let id = open_script(&mut host, "scoped.txt", text);
++    let id = open_script(&mut host, "mixed.txt", text);
+     let codes = transcode_codes(&host, &id);
+     assert!(
+         !codes.contains(&DiagnosticCode::LocalisationMixedEncoding)
+             && !codes.contains(&DiagnosticCode::LocalisationBrokenEscapeSequence)
+             && !codes.contains(&DiagnosticCode::LocalisationUnencodableCodePoint),
+-        "scoped-shaped text must stay diagnosis-free, got {codes:?}"
++        "mixed whole-file text must stay diagnosis-free, got {codes:?}"
+     );
+ }
+ 
+ #[test]
+-fn marker_outside_strings_is_a_mixed_error() {
+-    // A marker in code position (outside quotes and comments) anchors the
+-    // mixed-encoding error at itself.
++fn valid_escape_triples_outside_strings_are_supported() {
+     let mut host = eu4_host(game::eu4::runtime_rules().expect("first-party rules"));
++    let encoded = transcode::encode_text("中文", transcode::EscapeSet::Paratranz).expect("encode");
+     let id = open_script(
+         &mut host,
+-        "damaged.txt",
+-        "name = \"x\"\r\na \u{0010}AB\r\n".to_owned(),
++        "mixed.txt",
++        format!("# {encoded}\nname = 中文\n"),
+     );
++    let codes = transcode_codes(&host, &id);
++    assert!(!codes.contains(&DiagnosticCode::LocalisationMixedEncoding));
++    assert!(!codes.contains(&DiagnosticCode::LocalisationBrokenEscapeSequence));
++}
++
++#[test]
++fn damaged_escape_in_a_comment_reports_its_position() {
++    let mut host = eu4_host(game::eu4::runtime_rules().expect("first-party rules"));
++    let id = open_script(&mut host, "damaged.txt", "# note \u{0010}\n".to_owned());
+     let diagnostics = diagnostics(&host.snapshot(), &id);
+-    let error = diagnostics
++    let diagnostic = diagnostics
+         .iter()
+-        .find(|diagnostic| diagnostic.code == DiagnosticCode::LocalisationMixedEncoding)
+-        .expect("out-of-span marker must be a mixed-encoding error");
+-    assert_eq!(error.severity, Severity::Error);
+-    assert!(error.message.contains("outside every quoted string"));
+-    // Anchored at the marker byte (14 bytes precede it in `name = "x"\r\na `).
+-    assert_eq!(error.range.start(), 14);
++        .find(|diagnostic| diagnostic.code == DiagnosticCode::LocalisationBrokenEscapeSequence)
++        .expect("comment damage must be reported");
++    assert_eq!(diagnostic.range.start(), 7);
+ }
+ 
+ #[test]
+ fn in_span_orphan_markers_report_as_repairable_warnings() {
+     // A marker with no payload inside a string is an orphan, not damage: the
+-    // scoped path passes it through and reports it for manual repair.
++    // conversion refuses it and reports the byte position for manual repair.
+     let mut host = eu4_host(game::eu4::runtime_rules().expect("first-party rules"));
+     let id = open_script(
+         &mut host,
+@@ -195,9 +200,8 @@ fn in_span_orphan_markers_report_as_repairable_warnings() {
+ }
+ 
+ #[test]
+-fn unencodable_code_points_outside_strings_are_not_flagged() {
+-    // Scoped saving keeps everything outside strings verbatim, so a refusal
+-    // only applies inside a quoted span.
++fn unencodable_code_points_in_comments_are_flagged() {
++    // Whole-file saving also checks comments.
+     let mut host = eu4_host(game::eu4::runtime_rules().expect("first-party rules"));
+     let id = open_script(
+         &mut host,
+@@ -206,7 +210,7 @@ fn unencodable_code_points_outside_strings_are_not_flagged() {
+     );
+     let codes = transcode_codes(&host, &id);
+     assert!(
+-        !codes.contains(&DiagnosticCode::LocalisationUnencodableCodePoint),
+-        "comment-position characters are never escaped, got {codes:?}"
++        codes.contains(&DiagnosticCode::LocalisationUnencodableCodePoint),
++        "whole-file conversion must check comment-position characters, got {codes:?}"
+     );
+ }
+diff --git a/crates/ide/src/transcode.rs b/crates/ide/src/transcode.rs
+index 67a5605..87594d3 100644
+--- a/crates/ide/src/transcode.rs
++++ b/crates/ide/src/transcode.rs
+@@ -1,24 +1,8 @@
+ //! Transcode diagnostics for the EU4dll double-byte patch ecosystem.
+ //!
+-//! The server sees documents as text (disk bytes were already read through the
+-//! UTF-8/CP1252 layer), so these checks classify the document text and report:
+-//!
+-//! * escape markers outside every quoted string — code or comment position —
+-//!   (`LocalisationMixedEncoding`); inside strings a marker is either part of
+-//!   a scoped escape (readable CJK sharing the span self-heals on save
+-//!   through the decoded view) or a repairable orphan;
+-//! * orphan escape markers inside strings that decoding passed through
+-//!   (`LocalisationBrokenEscapeSequence`);
+-//! * code points inside strings that the transcoder refuses
+-//!   (`LocalisationUnencodableCodePoint`), while the script profile accepts
+-//!   the 27 CP1252 letters — outside strings scoped saving keeps bytes
+-//!   verbatim, so no refusal applies there;
+-//! * script files that decode correctly but re-encode differently
+-//!   (`ScriptLegacyEscapeVariant`, Hint).
+-//!
+-//! The extension's save gate refuses double-encoding client-side
+-//! (`LocalisationEscapeRefused`); that code is registered here for
+-//! filtering/severity overrides but never emitted by the server.
++//! The same whole-file rules apply to comments, identifiers and strings. Valid
++//! escaped/readable mixtures are supported. Damaged triples report their input
++//! position, and unencodable characters are checked across the complete file.
+ 
+ use crate::support::ParsedInput;
+ use crate::types::{CancellationToken, Cancelled, Diagnostic, DiagnosticCode, Severity};
+@@ -38,68 +22,31 @@ pub(crate) fn transcode_diagnostics(
+     }
+     let source: &str = input.source.as_ref();
+     let mut diagnostics = Vec::new();
+-    match transcode::classify_text(source) {
+-        transcode::Classification::Mixed => {
+-            let bytes = source.as_bytes();
+-            match transcode::marker_outside_spans(bytes).first() {
+-                Some(&offset) => {
+-                    if let Some(range) = char_range(source, offset) {
+-                        diagnostics.push(Diagnostic::new(
+-                            DiagnosticCode::LocalisationMixedEncoding,
+-                            Severity::Error,
+-                            range,
+-                            "escape marker outside every quoted string: damaged transcoded \
+-                             content — no transformation is applied, fix the file manually"
+-                                .to_owned(),
+-                        ));
+-                    }
+-                }
+-                None => {
+-                    // Scoped shape: orphan markers survive only inside strings.
+-                    // Span boundaries fall on ASCII structural bytes, so text
+-                    // slices at them are char-safe.
+-                    for (start, end) in transcode::scan_string_spans(bytes) {
+-                        cancellation.checkpoint()?;
+-                        let Some(span) = source.get(start..end) else {
+-                            continue;
+-                        };
+-                        for offset in transcode::decode_text(span).broken_sequences {
+-                            if diagnostics.len() >= MAX_TRANSCODE_DIAGNOSTICS {
+-                                break;
+-                            }
+-                            if let Some(range) = char_range(source, start + offset) {
+-                                diagnostics.push(Diagnostic::new(
+-                                    DiagnosticCode::LocalisationBrokenEscapeSequence,
+-                                    Severity::Warning,
+-                                    range,
+-                                    "orphan EU4dll escape marker: the surrounding triple is \
+-                                     damaged and was passed through undecoded"
+-                                        .to_owned(),
+-                                ));
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-        transcode::Classification::Escaped => {
+-            if input.format == FileFormat::Script
+-                && !transcode::script_roundtrip_is_canonical(source)
+-            {
+-                diagnostics.push(Diagnostic::new(
+-                    DiagnosticCode::ScriptLegacyEscapeVariant,
+-                    Severity::Hint,
+-                    TextRange::empty(TextSize::from(
+-                        u32::try_from(source.len()).unwrap_or(u32::MAX),
+-                    )),
+-                    "this file was written with a historical EU4dll escape-set variant: it \
+-                     decodes correctly, but saving normalizes the triples to the canonical set"
+-                        .to_owned(),
+-                ));
+-            }
+-        }
+-        transcode::Classification::Readable => {}
+-        transcode::Classification::Ascii => {}
++    // LSP text carries script bytes through the CP1252 Unicode layer. The
++    // localisation byte profile validates that layer without mistaking UTF-8
++    // payload characters for raw single-byte triple members.
++    if let Err(transcode::FileConversionError::BrokenEscape { byte_index }) =
++        transcode::decode_buffer(source.as_bytes(), transcode::Profile::Localisation)
++        && let Some(range) = char_range(source, byte_index)
++    {
++        diagnostics.push(Diagnostic::new(
++            DiagnosticCode::LocalisationBrokenEscapeSequence,
++            Severity::Warning,
++            range,
++            "damaged EU4dll escape sequence: whole-file conversion is refused until this is repaired"
++                .to_owned(),
++        ));
++    }
++    if transcode::classify_text(source) == transcode::Classification::Escaped
++        && !transcode::script_roundtrip_is_canonical(source)
++    {
++        diagnostics.push(Diagnostic::new(
++            DiagnosticCode::ScriptLegacyEscapeVariant,
++            Severity::Hint,
++            TextRange::empty(TextSize::from(u32::try_from(source.len()).unwrap_or(u32::MAX))),
++            "this file was written with a historical EU4dll escape-set variant: it decodes correctly, \
++             but saving the decoded view normalizes the triples to the canonical set".to_owned(),
++        ));
+     }
+     if diagnostics.len() < MAX_TRANSCODE_DIAGNOSTICS {
+         diagnostics.extend(unencodable_diagnostics(source, cancellation)?);
+@@ -107,42 +54,43 @@ pub(crate) fn transcode_diagnostics(
+     Ok(diagnostics)
+ }
+ 
+-/// Per-character warnings for code points inside strings that the script
+-/// transcoder refuses. The 27 CP1252-mapped letters remain valid single bytes.
++/// Whole-file warnings for code points that the script encoder refuses.
++/// Existing triples are byte carriers, so their payload is not readable input.
+ fn unencodable_diagnostics(
+     source: &str,
+     cancellation: &CancellationToken,
+ ) -> Result<Vec<Diagnostic>, Cancelled> {
+     let mut diagnostics = Vec::new();
+-    for (start, end) in transcode::scan_string_spans(source.as_bytes()) {
++    let mut characters = source.char_indices();
++    while let Some((offset, character)) = characters.next() {
+         cancellation.checkpoint()?;
+-        let Some(span) = source.get(start..end) else {
++        if (0x10..=0x13).contains(&u32::from(character)) {
++            characters.next();
++            characters.next();
+             continue;
+-        };
+-        for (offset, character) in span.char_indices() {
++        }
++        if let Some(kind) =
++            transcode::file_unencodable_kind(u32::from(character), transcode::Profile::Script)
++        {
++            let reason = match kind {
++                transcode::UnencodableKind::MangledLowPlane => {
++                    "U+0100..U+0FFF characters are silently mangled by the EU4 transcoder"
++                }
++                transcode::UnencodableKind::BeyondBmp => {
++                    "characters beyond the BMP are destroyed by the EU4 transcoder"
++                }
++            };
++            diagnostics.push(Diagnostic::new(
++                DiagnosticCode::LocalisationUnencodableCodePoint,
++                Severity::Warning,
++                char_range(source, offset).unwrap_or_else(|| TextRange::empty(0)),
++                format!(
++                    "{character} (U+{:04X}) cannot be round-tripped: {reason}",
++                    u32::from(character)
++                ),
++            ));
+             if diagnostics.len() >= MAX_TRANSCODE_DIAGNOSTICS {
+-                return Ok(diagnostics);
+-            }
+-            if let Some(kind) =
+-                transcode::file_unencodable_kind(u32::from(character), transcode::Profile::Script)
+-            {
+-                let reason = match kind {
+-                    transcode::UnencodableKind::MangledLowPlane => {
+-                        "U+0100..U+0FFF characters are silently mangled by the EU4 transcoder"
+-                    }
+-                    transcode::UnencodableKind::BeyondBmp => {
+-                        "characters beyond the BMP are destroyed by the EU4 transcoder"
+-                    }
+-                };
+-                diagnostics.push(Diagnostic::new(
+-                    DiagnosticCode::LocalisationUnencodableCodePoint,
+-                    Severity::Warning,
+-                    char_range(source, start + offset).unwrap_or_else(|| TextRange::empty(0)),
+-                    format!(
+-                        "{character} (U+{:04X}) cannot be round-tripped: {reason}",
+-                        u32::from(character)
+-                    ),
+-                ));
++                break;
+             }
+         }
+     }
+diff --git a/crates/pdc/src/initialize.rs b/crates/pdc/src/initialize.rs
+index 477f4d9..39e1b8d 100644
+--- a/crates/pdc/src/initialize.rs
++++ b/crates/pdc/src/initialize.rs
+@@ -285,7 +285,7 @@ pub(crate) fn prepare_initialize_candidate(
+             host.snapshot().source_files().len()
+         ));
+     }
+-    let result = serde_json::to_value(InitializeResult {
++    let mut result = serde_json::to_value(InitializeResult {
+         capabilities: ServerCapabilities {
+             text_document_sync: Some(TextDocumentSyncCapability::Options(
+                 TextDocumentSyncOptions {
+@@ -333,6 +333,7 @@ pub(crate) fn prepare_initialize_candidate(
+                     work_done_progress_options: WorkDoneProgressOptions::default(),
+                 }),
+             ),
++            experimental: Some(serde_json::json!({"pdcQueryPagination":true,"pdcHiddenEventOptions":true,"pdcScanDetails":true})),
+             ..ServerCapabilities::default()
+         },
+         server_info: Some(ServerInfo {
+@@ -344,6 +345,7 @@ pub(crate) fn prepare_initialize_candidate(
+         code: INTERNAL_ERROR,
+         message: format!("failed to serialize initialize result: {error}"),
+     })?;
++    result["capabilities"]["experimental"]["pdcWholeFileTranscode"] = serde_json::Value::Bool(true);
+     Ok(PreparedInitialize {
+         host,
+         result,
+diff --git a/crates/pdc/src/requests.rs b/crates/pdc/src/requests.rs
+index c6c8849..cb31d4d 100644
+--- a/crates/pdc/src/requests.rs
++++ b/crates/pdc/src/requests.rs
+@@ -10,7 +10,7 @@ use ide::{
+     CancellationToken, Cancelled, CompletionKind, LocalisationKeyMatch, SemanticToken,
+     SemanticTokenType, complete_with_cancellation, completion_resolve,
+     definition_with_cancellation, document_symbols_with_cancellation, hover_with_cancellation,
+-    localisation_search_with_cancellation, localisation_values_by_key,
++    localisation_search_page_with_cancellation, localisation_values_by_key,
+     prepare_rename_with_cancellation, quick_fixes_with_cancellation, references_with_cancellation,
+     rename_with_cancellation, scope_inlay_hints_with_cancellation,
+     semantic_tokens_in_range_with_cancellation, semantic_tokens_with_cancellation,
+@@ -35,7 +35,7 @@ use rules::ParserKind;
+ use serde::Deserialize;
+ use serde_json::{Value, json};
+ use text::{LineIndex, LogicalPath, Position, TextRange};
+-use transcode::{Profile, ScopedEncodeError, ScopedForm};
++use transcode::Profile;
+ 
+ use crate::protocol::{
+     RpcError, cancelled_error, completion_kind,
+@@ -94,6 +94,26 @@ mod completion_sort_tests {
+ 
+ /// Trims a search filter and drops it when empty, so whitespace-only filters behave like
+ /// absent filters instead of matching everything (or nothing).
++fn validate_query_page(
++    snapshot: &AnalysisSnapshot,
++    offset: usize,
++    revision: Option<u64>,
++) -> Result<(), RpcError> {
++    if offset > 1_000_000 {
++        return Err(RpcError::new(
++            INVALID_PARAMS,
++            "query offset exceeds 1000000",
++        ));
++    }
++    if offset > 0 && revision != Some(snapshot.revision()) {
++        return Err(RpcError::new(
++            -32801,
++            "workspace changed or revision missing; restart the query",
++        ));
++    }
++    Ok(())
++}
++
+ fn trimmed_search_filter(value: Option<&str>) -> Option<&str> {
+     value.map(str::trim).filter(|value| !value.is_empty())
+ }
+@@ -180,10 +200,6 @@ struct TranscodeDecodeParams {
+     /// still decides the transcoding profile; the response classifies exactly
+     /// the supplied buffer.
+     bytes: Option<String>,
+-    /// Manual conversion: decode only quoted escape triples, preserving comments
+-    /// and readable fragments byte-for-byte instead of classifying the whole file.
+-    #[serde(default)]
+-    quoted_only: bool,
+ }
+ 
+ #[derive(Clone, Debug, Deserialize)]
+@@ -194,15 +210,14 @@ struct TranscodeEncodeParams {
+     path: String,
+     /// Readable editor-buffer bytes as a hex string.
+     bytes: String,
+-    /// Manual conversion of disk bytes: keep existing quoted escape triples and
+-    /// encode only readable fragments. Comments are never interpreted.
+-    #[serde(default)]
+-    preserve_escaped: bool,
+ }
+ 
+ #[derive(Clone, Debug, Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "camelCase")]
+ struct RuleSearchParams {
++    #[serde(default)]
++    offset: usize,
++    revision: Option<u64>,
+     context: Option<String>,
+     key: Option<String>,
+     scope: Option<String>,
+@@ -230,6 +245,9 @@ impl From<LocalisationKeyMatchWire> for LocalisationKeyMatch {
+ #[derive(Clone, Debug, Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "camelCase")]
+ struct LocalisationSearchParams {
++    #[serde(default)]
++    offset: usize,
++    revision: Option<u64>,
+     key: Option<String>,
+     text: Option<String>,
+     /// How `key` is matched: `substring` (default), `exact`, or `prefix`.
+@@ -241,6 +259,9 @@ struct LocalisationSearchParams {
+ #[derive(Clone, Debug, Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "camelCase")]
+ struct SymbolSearchParams {
++    #[serde(default)]
++    offset: usize,
++    revision: Option<u64>,
+     query: String,
+     limit: Option<usize>,
+ }
+@@ -248,6 +269,9 @@ struct SymbolSearchParams {
+ #[derive(Clone, Debug, Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "camelCase")]
+ struct SymbolReferencesParams {
++    #[serde(default)]
++    offset: usize,
++    revision: Option<u64>,
+     name: String,
+     /// Optional symbol kind used to disambiguate names defined under several kinds.
+     kind: Option<String>,
+@@ -418,13 +442,9 @@ impl SnapshotRequestContext {
+         Ok(Value::Array(results))
+     }
+ 
+-    /// Classifies/decodes one file for the transparent-localisation view: `plain`/`damaged`
+-    /// bytes pass through unchanged, `whole` takes the legacy whole-file decoder, and
+-    /// `scoped` resolves escape triples inside quoted strings only. The bytes come from
+-    /// disk unless the caller supplies a `bytes` buffer (an unsaved editor buffer) to
+-    /// classify instead. Nothing is written; the client owns the file bytes, the write
+-    /// gate, and the presentation of the refusal metadata (`broken`, `damagedAt`,
+-    /// `quotedCjk`).
++    /// Decodes escape triples throughout one file, including comments and bare
++    /// text. Refusals contain no transformed output; damaged views retain original
++    /// bytes for repair. Supplied buffer bytes take precedence over disk contents.
+     fn transcode_decode(&self, params: Option<&Value>) -> Result<Value, RpcError> {
+         let params = typed_params::<TranscodeDecodeParams>(params, "transcode decode")?;
+         self.ensure_active()?;
+@@ -449,66 +469,42 @@ impl SnapshotRequestContext {
+         let Some(profile) = self.transcode_profile_for(&path) else {
+             return Ok(json!({ "eligible": false }));
+         };
+-        if params.quoted_only {
+-            let mut result =
+-                quoted_conversion_result(transcode::decode_quoted_file(&bytes, profile));
+-            result["eligible"] = Value::Bool(true);
+-            result["profile"] = Value::from(transcode_profile_name(profile));
+-            return Ok(result);
+-        }
+-        let form = transcode::scoped_form(&bytes, profile);
+-        let form_name = scoped_form_name(form);
+         let profile_name = transcode_profile_name(profile);
+-        let (bytes, broken, damaged_at, quoted_cjk) = match form {
+-            ScopedForm::Plain | ScopedForm::Damaged => {
+-                let damaged_at = (form == ScopedForm::Damaged)
+-                    .then(|| transcode::marker_outside_spans(&bytes).first().copied())
+-                    .flatten();
+-                let quoted_cjk = form == ScopedForm::Plain && has_quoted_cjk(&bytes);
+-                (bytes, 0usize, damaged_at, quoted_cjk)
+-            }
+-            ScopedForm::WholeEscaped => match transcode::decode_file(&bytes, profile) {
+-                Err(_) => {
+-                    return Ok(transcode_decode_refusal(profile_name, form_name));
+-                }
+-                Ok(decoded) => (
+-                    decoded.text.into_bytes(),
+-                    decoded.broken_sequences.len(),
+-                    None,
+-                    false,
+-                ),
+-            },
+-            ScopedForm::Scoped => match transcode::scoped_decode_file(&bytes, profile) {
+-                Err(_) => {
+-                    return Ok(transcode_decode_refusal(profile_name, form_name));
+-                }
+-                Ok(decoded) => (
+-                    decoded.text.into_bytes(),
+-                    decoded.in_span_broken.len(),
+-                    None,
+-                    false,
+-                ),
+-            },
++        let has_markers = bytes.iter().any(|byte| (0x10..=0x13).contains(byte));
++        let form = if !has_markers {
++            "plain"
++        } else if transcode::classify_file(&bytes, profile) == transcode::Classification::Escaped {
++            "whole"
++        } else {
++            "mixed"
+         };
+-        let mut result = json!({
+-            "eligible": true,
+-            "profile": profile_name,
+-            "form": form_name,
+-            "bytes": encode_hex(&bytes),
+-            "broken": broken,
+-            "quotedCjk": quoted_cjk,
+-        });
+-        if let Some(damaged_at) = damaged_at {
+-            result["damagedAt"] = Value::from(damaged_at);
++        match transcode::decode_buffer(&bytes, profile) {
++            Ok(decoded) => {
++                let needs_encoding = !has_markers
++                    && transcode::encode_buffer(&bytes, profile, transcode::EscapeSet::Paratranz)
++                        .map_or(true, |encoded| encoded != bytes);
++                Ok(json!({
++                    "eligible": true, "profile": profile_name, "form": form,
++                    "bytes": encode_hex(&decoded), "broken": 0,
++                    "needsEncoding": needs_encoding,
++                }))
++            }
++            Err(transcode::FileConversionError::InvalidUtf8) => Ok(json!({
++                "eligible": true, "profile": profile_name, "form": "damaged",
++                "error": "invalid-utf8", "refused": "invalidUtf8",
++            })),
++            Err(transcode::FileConversionError::BrokenEscape { byte_index }) => Ok(json!({
++                "eligible": true, "profile": profile_name, "form": "damaged",
++                "bytes": encode_hex(&bytes), "broken": 1, "damagedAt": byte_index,
++                "needsEncoding": false, "refused": "brokenEscape", "offsets": [byte_index],
++            })),
++            Err(error) => Ok(file_conversion_result(Err(error))),
+         }
+-        Ok(result)
+     }
+ 
+-    /// Encodes readable text into scoped-escaped bytes for one file. The three refusal
+-    /// shapes mirror the extension's save gate: `invalidUtf8` (buffer is not UTF-8),
+-    /// `alreadyEscaped` (iron rule ② — in-span escape markers would double-encode), and
+-    /// `unencodable` (code points the EU4 ecosystem cannot round-trip). Nothing is
+-    /// written; the client receives the encoded bytes and persists them itself.
++    /// Encodes readable content throughout the file, preserving valid existing
++    /// triples. Invalid localisation UTF-8, damaged triples or unencodable text
++    /// refuse the entire operation; nothing is written by the server.
+     fn transcode_encode(&self, params: Option<&Value>) -> Result<Value, RpcError> {
+         let params = typed_params::<TranscodeEncodeParams>(params, "transcode encode")?;
+         self.ensure_active()?;
+@@ -525,41 +521,14 @@ impl SnapshotRequestContext {
+         let Some(profile) = self.transcode_profile_for(&path) else {
+             return Err(RpcError::new(
+                 INVALID_PARAMS,
+-                format!(
+-                    "path is not eligible for transparent localisation: {}",
+-                    params.path
+-                ),
++                format!("path is not eligible for transcoding: {}", params.path),
+             ));
+         };
+-        if params.preserve_escaped {
+-            return Ok(quoted_conversion_result(transcode::encode_quoted_file(
+-                &bytes,
+-                profile,
+-                transcode::EscapeSet::Paratranz,
+-            )));
+-        }
+-        let text = match std::str::from_utf8(&bytes) {
+-            Ok(text) => text,
+-            Err(_) => return Ok(json!({ "refused": "invalidUtf8" })),
+-        };
+-        match transcode::scoped_encode_file(text, profile, transcode::EscapeSet::Paratranz) {
+-            Ok(encoded) => Ok(json!({ "bytes": encode_hex(&encoded) })),
+-            Err(ScopedEncodeError::AlreadyEscaped { positions }) => Ok(json!({
+-                "refused": "alreadyEscaped",
+-                "offsets": positions,
+-            })),
+-            Err(ScopedEncodeError::Unencodable { error }) => Ok(json!({
+-                "refused": "unencodable",
+-                "points": error
+-                    .unencodable
+-                    .iter()
+-                    .map(|point| json!({
+-                        "codePoint": point.code_point,
+-                        "byteIndex": point.byte_index,
+-                    }))
+-                    .collect::<Vec<_>>(),
+-            })),
+-        }
++        Ok(file_conversion_result(transcode::encode_buffer(
++            &bytes,
++            profile,
++            transcode::EscapeSet::Paratranz,
++        )))
+     }
+ 
+     /// Transparent-localisation eligibility of an absolute path: localisation yml under a
+@@ -586,6 +555,7 @@ impl SnapshotRequestContext {
+     /// rule set is consulted.
+     fn rule_search(&self, params: Option<&Value>) -> Result<Value, RpcError> {
+         let params = typed_params::<RuleSearchParams>(params, "rule search")?;
++        validate_query_page(&self.snapshot, params.offset, params.revision)?;
+         let context = trimmed_search_filter(params.context.as_deref());
+         let key = trimmed_search_filter(params.key.as_deref());
+         let scope = trimmed_search_filter(params.scope.as_deref());
+@@ -603,6 +573,7 @@ impl SnapshotRequestContext {
+         let scope_query = scope.map(str::to_ascii_lowercase);
+         let mut entries = Vec::new();
+         let mut truncated = false;
++        let mut matched = 0usize;
+         let ir = self.snapshot.ir();
+ 
+         for schema in &ir.schemas {
+@@ -656,6 +627,10 @@ impl SnapshotRequestContext {
+                 }) {
+                     continue;
+                 }
++                matched += 1;
++                if matched <= params.offset {
++                    continue;
++                }
+                 if entries.len() == limit {
+                     truncated = true;
+                     break;
+@@ -674,7 +649,9 @@ impl SnapshotRequestContext {
+                 break;
+             }
+         }
+-        Ok(serde_json::json!({"rules":entries,"truncated":truncated}))
++        Ok(
++            serde_json::json!({"revision":self.snapshot.revision(),"nextOffset":truncated.then_some(params.offset + entries.len()),"rules":entries,"truncated":truncated}),
++        )
+     }
+ 
+     /// Bounded search over indexed localisation definitions by key and/or value substring.
+@@ -682,6 +659,7 @@ impl SnapshotRequestContext {
+     /// preview and logical file path.
+     fn localisation_search(&self, params: Option<&Value>) -> Result<Value, RpcError> {
+         let params = typed_params::<LocalisationSearchParams>(params, "localisation search")?;
++        validate_query_page(&self.snapshot, params.offset, params.revision)?;
+         let key = trimmed_search_filter(params.key.as_deref());
+         let text = trimmed_search_filter(params.text.as_deref());
+         if key.is_none() && text.is_none() {
+@@ -696,11 +674,12 @@ impl SnapshotRequestContext {
+         let limit = query_search_limit(params.limit)?;
+         self.ensure_active()?;
+ 
+-        let result = localisation_search_with_cancellation(
++        let result = localisation_search_page_with_cancellation(
+             &self.snapshot,
+             key,
+             text,
+             key_match,
++            params.offset,
+             limit,
+             &self.cancellation,
+         )
+@@ -722,7 +701,9 @@ impl SnapshotRequestContext {
+                 })
+             })
+             .collect::<Vec<_>>();
+-        Ok(serde_json::json!({ "hits": hits, "truncated": result.truncated }))
++        Ok(
++            serde_json::json!({ "revision":self.snapshot.revision(), "nextOffset":result.truncated.then_some(params.offset + hits.len()), "hits": hits, "truncated": result.truncated }),
++        )
+     }
+ 
+     /// One client-facing location: the file URI, a 1-based line, and the logical path when the
+@@ -737,6 +718,7 @@ impl SnapshotRequestContext {
+         Ok(serde_json::json!({
+             "uri": lsp.uri.as_str(),
+             "line": lsp.range.start.line + 1,
++            "range": lsp.range,
+             "path": location.path.as_ref().map(|path| path.as_str()),
+         }))
+     }
+@@ -746,6 +728,7 @@ impl SnapshotRequestContext {
+     /// search in the script zone; scripted localisation (`defined_text`) stays searchable.
+     fn symbol_search(&self, params: Option<&Value>) -> Result<Value, RpcError> {
+         let params = typed_params::<SymbolSearchParams>(params, "symbol search")?;
++        validate_query_page(&self.snapshot, params.offset, params.revision)?;
+         let query = trimmed_search_filter(Some(params.query.as_str()))
+             .ok_or_else(|| RpcError::new(INVALID_PARAMS, "symbol search requires a query"))?;
+         let limit = symbol_search_limit(params.limit)?;
+@@ -755,17 +738,22 @@ impl SnapshotRequestContext {
+                 .map_err(cancelled_error)?;
+         let mut hits = Vec::new();
+         let mut truncated = false;
++        let mut matched = 0usize;
+         for symbol in symbols {
+             if symbol.kind.eq_ignore_ascii_case("localisation") {
+                 continue;
+             }
++            let Some(lsp) = location_to_lsp(&self.snapshot, &symbol.location) else {
++                continue;
++            };
++            matched += 1;
++            if matched <= params.offset {
++                continue;
++            }
+             if hits.len() == limit {
+                 truncated = true;
+                 break;
+             }
+-            let Some(lsp) = location_to_lsp(&self.snapshot, &symbol.location) else {
+-                continue;
+-            };
+             hits.push(serde_json::json!({
+                 "name": symbol.name,
+                 "kind": symbol.kind,
+@@ -774,7 +762,9 @@ impl SnapshotRequestContext {
+                 "path": symbol.location.path.as_ref().map(|path| path.as_str()),
+             }));
+         }
+-        Ok(serde_json::json!({ "symbols": hits, "truncated": truncated }))
++        Ok(
++            serde_json::json!({ "revision":self.snapshot.revision(), "nextOffset":truncated.then_some(params.offset + hits.len()), "symbols": hits, "truncated": truncated }),
++        )
+     }
+ 
+     /// Name-addressed find-references for script-zone symbols: resolves the active winner for
+@@ -782,6 +772,7 @@ impl SnapshotRequestContext {
+     /// reference locations without needing an open document or a cursor position.
+     fn symbol_references(&self, params: Option<&Value>) -> Result<Value, RpcError> {
+         let params = typed_params::<SymbolReferencesParams>(params, "symbol references")?;
++        validate_query_page(&self.snapshot, params.offset, params.revision)?;
+         let name = trimmed_search_filter(Some(params.name.as_str()))
+             .ok_or_else(|| RpcError::new(INVALID_PARAMS, "symbol references requires a name"))?;
+         let kind = trimmed_search_filter(params.kind.as_deref());
+@@ -844,7 +835,7 @@ impl SnapshotRequestContext {
+         let total = references.len();
+         let mut items = Vec::new();
+         let mut truncated = false;
+-        for reference in &references {
++        for reference in references.iter().skip(params.offset) {
+             if items.len() == limit {
+                 truncated = true;
+                 break;
+@@ -852,6 +843,8 @@ impl SnapshotRequestContext {
+             items.push(self.location_value(reference)?);
+         }
+         Ok(serde_json::json!({
++            "revision": self.snapshot.revision(),
++            "nextOffset": truncated.then_some(params.offset + items.len()),
+             "matched": true,
+             "symbol": {
+                 "name": name,
+@@ -886,6 +879,7 @@ impl SnapshotRequestContext {
+                     SourceRootKind::Project => "project",
+                 };
+                 serde_json::json!({
++                    "id": root.id.get(),
+                     "kind": kind,
+                     "path": root.path,
+                     "order": root.order,
+@@ -922,17 +916,25 @@ impl SnapshotRequestContext {
+             "irHash": self.snapshot.ir_fingerprint(),
+             "revision": self.snapshot.revision(),
+             "roots": roots,
++            "fileCountsScope": "all indexed roots",
+             "fileCounts": {
+                 "script": script_files,
+                 "localisation": localisation_files,
+                 "total": self.snapshot.source_files().len(),
+             },
+             "scan": {
++                "scope": "live roots; installed caches excluded",
++                "rootIds": scan.scanned_roots.iter().map(|root|root.get()).collect::<Vec<_>>(),
++                "excludedFiles": scan.excluded_files,
++                "omittedExclusions": scan.omitted_exclusions,
++                "excludedEntries": scan.excluded_entries.iter().map(|issue| json!({"path":issue.path,"reason":format!("{:?}",issue.kind),"detail":issue.detail})).collect::<Vec<_>>(),
+                 "discoveredFiles": scan.discovered_files,
+                 "indexedFiles": scan.indexed_files,
+                 "legacyEncodedFiles": scan.legacy_encoded_files,
+                 "skippedEntries": scan.skipped_entries,
+                 "issues": scan.issues.len(),
++                "omittedIssues": scan.omitted_issues,
++                "details": scan.issues.iter().map(|issue| json!({"path":issue.path,"reason":format!("{:?}",issue.kind),"detail":issue.detail})).collect::<Vec<_>>(),
+             },
+             "symbols": {
+                 "definitions": definitions,
+@@ -2206,15 +2208,6 @@ fn transcode_target_path(raw: &str) -> Result<std::path::PathBuf, RpcError> {
+     Ok(path)
+ }
+ 
+-fn scoped_form_name(form: ScopedForm) -> &'static str {
+-    match form {
+-        ScopedForm::Plain => "plain",
+-        ScopedForm::WholeEscaped => "whole",
+-        ScopedForm::Scoped => "scoped",
+-        ScopedForm::Damaged => "damaged",
+-    }
+-}
+-
+ fn transcode_profile_name(profile: Profile) -> &'static str {
+     match profile {
+         Profile::Localisation => "localisation",
+@@ -2223,16 +2216,16 @@ fn transcode_profile_name(profile: Profile) -> &'static str {
+ }
+ 
+ /// Manual conversion is all-or-nothing; refusal metadata never carries output bytes.
+-fn quoted_conversion_result(result: Result<Vec<u8>, transcode::QuotedConversionError>) -> Value {
++fn file_conversion_result(result: Result<Vec<u8>, transcode::FileConversionError>) -> Value {
+     match result {
+         Ok(bytes) => json!({ "bytes": encode_hex(&bytes) }),
+-        Err(transcode::QuotedConversionError::InvalidUtf8) => {
++        Err(transcode::FileConversionError::InvalidUtf8) => {
+             json!({ "refused": "invalidUtf8" })
+         }
+-        Err(transcode::QuotedConversionError::BrokenEscape { byte_index }) => {
++        Err(transcode::FileConversionError::BrokenEscape { byte_index }) => {
+             json!({ "refused": "brokenEscape", "offsets": [byte_index] })
+         }
+-        Err(transcode::QuotedConversionError::Unencodable { error }) => json!({
++        Err(transcode::FileConversionError::Unencodable { error }) => json!({
+             "refused": "unencodable",
+             "points": error.unencodable.iter().map(|point| json!({
+                 "codePoint": point.code_point,
+@@ -2242,15 +2235,6 @@ fn quoted_conversion_result(result: Result<Vec<u8>, transcode::QuotedConversionE
+     }
+ }
+ 
+-fn transcode_decode_refusal(profile_name: &str, form_name: &str) -> Value {
+-    json!({
+-        "eligible": true,
+-        "profile": profile_name,
+-        "form": form_name,
+-        "error": "invalid-utf8",
+-    })
+-}
+-
+ /// Lowercases hex, matching the differential-vector wire convention used across the
+ /// transcode tooling.
+ fn encode_hex(bytes: &[u8]) -> String {
+@@ -2277,18 +2261,142 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
+     }
+     Some(output)
+ }
++#[cfg(test)]
++mod pagination_tests {
++    use super::*;
++    use crate::tests::{first_party_host, temp_workspace_dir};
++    use engine::{SourceRoot, SourceRootId, WorkspaceChange};
++    use text::AbsPath;
++
++    fn context(host: &engine::AnalysisHost) -> SnapshotRequestContext {
++        SnapshotRequestContext::new(
++            host.snapshot(),
++            CancellationToken::new(),
++            false,
++            Arc::new(HashSet::new()),
++            Arc::new(BTreeMap::new()),
++            Arc::new(GlobIncludePatterns::default()),
++            Arc::new(SemanticTokensCache::default()),
++        )
++    }
+ 
+-/// Whether any quoted string holds raw CJK — the content a plain-form save encodes.
+-/// Non-UTF-8 input cannot hold CJK on the CP1252 byte layer and reports `false`.
+-fn has_quoted_cjk(bytes: &[u8]) -> bool {
+-    let Ok(text) = std::str::from_utf8(bytes) else {
+-        return false;
+-    };
+-    transcode::scan_string_spans(bytes)
+-        .iter()
+-        .any(|&(start, end)| {
+-            // Span boundaries sit on ASCII quote bytes, so byte offsets are char-safe.
+-            let span = &text[start..end.min(text.len())];
+-            span.chars().any(|c| transcode::is_raw_cjk(u32::from(c)))
+-        })
++    #[test]
++    fn named_queries_page_without_repeating_winners_and_reject_stale_revisions() {
++        let (root, _) = temp_workspace_dir();
++        for directory in [
++            "common/scripted_effects",
++            "events",
++            "localisation",
++            "common/custom_gui",
++        ] {
++            std::fs::create_dir_all(root.join(directory)).unwrap();
++        }
++        let definitions = (0..55)
++            .map(|n| format!("query_page_effect_{n} = {{ add_prestige = 1 }}\n"))
++            .collect::<String>();
++        std::fs::write(root.join("common/scripted_effects/pages.txt"), definitions).unwrap();
++        let localisation = format!(
++            "\u{feff}l_english:\n{}",
++            (0..55)
++                .map(|n| format!(" query_page_{n}:0 \"Page {n}\"\n"))
++                .collect::<String>()
++        );
++        std::fs::write(root.join("localisation/pages_l_english.yml"), localisation).unwrap();
++        std::fs::write(root.join("common/custom_gui/empty.txt"), "").unwrap();
++        std::fs::write(root.join("events/outside_profile.md"), "Notes").unwrap();
++        std::fs::write(
++            root.join("events/caller.txt"),
++            format!(
++                "country_event = {{ id = query_page.1 hidden = yes immediate = {{ {} }} }}",
++                "query_page_effect_0 = yes ".repeat(60)
++            ),
++        )
++        .unwrap();
++        let mut host = first_party_host();
++        host.apply_change(WorkspaceChange::SetSourceRoots(vec![SourceRoot::new(
++            SourceRootId::new(1),
++            SourceRootKind::Project,
++            AbsPath::normalize(&root),
++        )]));
++        host.refresh_source_roots().unwrap();
++        let query = context(&host);
++        let revision = query.snapshot.revision();
++        for (method, base, array, expected) in [
++            (
++                "pdc/symbolSearch",
++                json!({"query":"query_page_effect","limit":17}),
++                "symbols",
++                55,
++            ),
++            (
++                "pdc/localisationSearch",
++                json!({"key":"query_page_","keyMatch":"prefix","limit":17}),
++                "hits",
++                55,
++            ),
++            (
++                "pdc/symbolReferences",
++                json!({"name":"query_page_effect_0","kind":"scripted_effect","limit":17}),
++                "references",
++                61,
++            ),
++        ] {
++            let mut params = base;
++            let mut found = Vec::new();
++            loop {
++                let page = query.dispatch(method, Some(&params)).unwrap();
++                found.extend(page[array].as_array().unwrap().iter().cloned());
++                let Some(next) = page["nextOffset"].as_u64() else {
++                    break;
++                };
++                params["offset"] = json!(next);
++                params["revision"] = json!(revision);
++            }
++            assert_eq!(found.len(), expected, "{method}");
++            let unique = found
++                .iter()
++                .map(Value::to_string)
++                .collect::<std::collections::BTreeSet<_>>();
++            assert_eq!(unique.len(), expected, "{method}");
++            params["offset"] = json!(1);
++            params["revision"] = json!(revision + 1);
++            assert_eq!(
++                query.dispatch(method, Some(&params)).unwrap_err().code,
++                -32801
++            );
++        }
++        let first = query
++            .dispatch(
++                "pdc/ruleSearch",
++                Some(&json!({"context":"effect","key":"add_prestige","limit":1})),
++            )
++            .unwrap();
++        let next = first["nextOffset"]
++            .as_u64()
++            .expect("multiple applicable rules");
++        let second = query.dispatch("pdc/ruleSearch", Some(&json!({"context":"effect","key":"add_prestige","limit":1,"offset":next,"revision":revision}))).unwrap();
++        assert_ne!(first["rules"][0]["id"], second["rules"][0]["id"]);
++        let summary = query.dispatch("pdc/workspaceSummary", None).unwrap();
++        assert_eq!(summary["roots"][0]["id"], 1);
++        assert_eq!(summary["scan"]["rootIds"], json!([1]));
++        assert!(
++            summary["scan"]["excludedEntries"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .any(|item| item["path"]
++                    .as_str()
++                    .unwrap()
++                    .ends_with("events/outside_profile.md"))
++        );
++        let files = query.dispatch("pdc/workspaceFiles", None).unwrap();
++        assert!(
++            files["files"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .any(|file| file["logicalPath"] == "common/custom_gui/empty.txt")
++        );
++        std::fs::remove_dir_all(root).unwrap();
++    }
+ }
+diff --git a/crates/pdc/src/tests/transcode_requests.rs b/crates/pdc/src/tests/transcode_requests.rs
+index 65201d4..0a84166 100644
+--- a/crates/pdc/src/tests/transcode_requests.rs
++++ b/crates/pdc/src/tests/transcode_requests.rs
+@@ -8,7 +8,7 @@ use std::io::Cursor;
+ use std::path::{Path, PathBuf};
+ 
+ use serde_json::{Value, json};
+-use transcode::{EscapeSet, Profile, encode_file, scoped_encode_file};
++use transcode::{EscapeSet, Profile, encode_file};
+ 
+ use super::*;
+ 
+@@ -105,227 +105,121 @@ fn encode_request(path: &Path, bytes: &[u8]) -> Value {
+ }
+ 
+ #[test]
+-fn transcode_decode_dispatches_plain_whole_and_scoped_forms() {
++fn transcode_complete_files_and_mixed_input_round_trip() {
+     let (root, root_uri) = temp_workspace_dir();
+-    let plain = write_file(&root, "events/plain.txt", READABLE_SCRIPT.as_bytes());
+-    let whole_bytes = encode_file(READABLE_LOC, Profile::Localisation, EscapeSet::Paratranz)
+-        .expect("whole-encoded fixture");
+-    let whole = write_file(&root, "localisation/test_l_english.yml", &whole_bytes);
+-    let scoped_bytes = scoped_encode_file(READABLE_SCRIPT, Profile::Script, EscapeSet::Paratranz)
+-        .expect("scoped-encoded fixture");
+-    let scoped = write_file(&root, "events/scoped.txt", &scoped_bytes);
+-
+-    let run = run_transcode_session(
++    let script = write_file(&root, "events/plain.txt", READABLE_SCRIPT.as_bytes());
++    let loc = write_file(
+         &root,
+-        &root_uri,
+-        json!({}),
+-        vec![
+-            decode_request(&plain),
+-            decode_request(&whole),
+-            decode_request(&scoped),
+-        ],
++        "localisation/test_l_english.yml",
++        READABLE_LOC.as_bytes(),
+     );
+-
+-    // Plain form passes the bytes through and flags the quoted CJK a save would encode.
+-    let result = run.result(2);
+-    assert_eq!(result["eligible"], json!(true));
+-    assert_eq!(result["profile"], json!("script"));
+-    assert_eq!(result["form"], json!("plain"));
+-    assert_eq!(result["bytes"], json!(hex(READABLE_SCRIPT.as_bytes())));
+-    assert_eq!(result["broken"], json!(0));
+-    assert_eq!(result["quotedCjk"], json!(true));
+-
+-    // Whole form decodes back to the readable localisation text.
+-    let result = run.result(3);
+-    assert_eq!(result["profile"], json!("localisation"));
+-    assert_eq!(result["form"], json!("whole"));
+-    assert_eq!(result["bytes"], json!(hex(READABLE_LOC.as_bytes())));
+-    assert_eq!(result["quotedCjk"], json!(false));
+-
+-    // Scoped form (readable CJK comment outside the spans) resolves only inside strings.
+-    let result = run.result(4);
+-    assert_eq!(result["profile"], json!("script"));
+-    assert_eq!(result["form"], json!("scoped"));
+-    assert_eq!(result["bytes"], json!(hex(READABLE_SCRIPT.as_bytes())));
+-
+-    fs::remove_dir_all(root).expect("cleanup");
+-}
+-
+-#[test]
+-fn transcode_decode_reports_damaged_content_and_ineligibility() {
+-    let (root, root_uri) = temp_workspace_dir();
+-    // A marker byte (0x10..=0x13) outside every quoted span marks damaged content.
+-    let damaged = b"# comment\nmarker \x11 here\n".to_vec();
+-    let damaged_path = write_file(&root, "events/damaged.txt", &damaged);
+-    let markdown = write_file(&root, "docs/readme.md", b"# readme\n");
+-    let outside_file = tempfile::Builder::new()
+-        .prefix("pdc-transcode-outside-")
+-        .suffix(".txt")
+-        .tempfile()
+-        .expect("outside fixture");
+-    fs::write(outside_file.path(), b"name = \"x\"\n").expect("outside fixture content");
+-    let outside = dunce::canonicalize(outside_file.path()).expect("canonical outside fixture");
+-
++    let whole_script = encode_file(READABLE_SCRIPT, Profile::Script, EscapeSet::Paratranz).unwrap();
++    let whole_loc = encode_file(READABLE_LOC, Profile::Localisation, EscapeSet::Paratranz).unwrap();
++    let unquoted = encode_file("# 中\n", Profile::Script, EscapeSet::Paratranz).unwrap();
++    let escaped_word = encode_file("中文", Profile::Script, EscapeSet::Paratranz).unwrap();
++    let mixed = [
++        "# 中文注释\nname = \"".as_bytes(),
++        &escaped_word,
++        "内容\"\n".as_bytes(),
++    ]
++    .concat();
+     let run = run_transcode_session(
+         &root,
+         &root_uri,
+         json!({}),
+         vec![
+-            decode_request(&damaged_path),
+-            decode_request(&markdown),
+-            decode_request(&outside),
++            decode_request(&script),
++            encode_request(&script, READABLE_SCRIPT.as_bytes()),
++            decode_request_with_bytes(&script, &whole_script),
++            encode_request(&script, &whole_script),
++            decode_request_with_bytes(&script, &unquoted),
++            decode_request_with_bytes(&script, &mixed),
++            encode_request(&loc, READABLE_LOC.as_bytes()),
++            decode_request_with_bytes(&loc, &whole_loc),
++            decode_request_with_bytes(&script, "# 中文注释\nname = \"x\"\n".as_bytes()),
+         ],
+     );
+-
+-    let result = run.result(2);
+-    assert_eq!(result["form"], json!("damaged"));
+-    assert_eq!(result["bytes"], json!(hex(&damaged)));
++    assert_eq!(run.result(2)["needsEncoding"], json!(true));
++    assert_eq!(run.result(3)["bytes"], hex(&whole_script));
++    assert_eq!(run.result(4)["bytes"], hex(READABLE_SCRIPT.as_bytes()));
++    assert_eq!(run.result(5)["bytes"], hex(&whole_script));
++    assert_eq!(run.result(6)["bytes"], hex("# 中\n".as_bytes()));
+     assert_eq!(
+-        result["damagedAt"],
+-        json!(damaged.iter().position(|b| *b == 0x11))
++        run.result(7)["bytes"],
++        hex("# 中文注释\nname = \"中文内容\"\n".as_bytes())
++    );
++    assert_eq!(run.result(8)["bytes"], hex(&whole_loc));
++    assert_eq!(run.result(9)["bytes"], hex(READABLE_LOC.as_bytes()));
++    assert_eq!(
++        run.result(10)["needsEncoding"],
++        json!(true),
++        "comment-only CJK participates"
+     );
+-
+-    assert_eq!(run.result(3), &json!({"eligible": false}));
+-    assert_eq!(run.result(4), &json!({"eligible": false}));
+-
+-    outside_file.close().expect("cleanup outside fixture");
+     fs::remove_dir_all(root).expect("cleanup");
+ }
+ 
+ #[test]
+-fn transcode_decode_classifies_supplied_buffer_bytes_over_disk() {
++fn transcode_refuses_damage_anywhere_without_partial_output() {
+     let (root, root_uri) = temp_workspace_dir();
+-    // On disk: pure ASCII — a fixed point the transparent view must leave alone.
+-    let ascii_script = write_file(&root, "events/plain.txt", b"name = \"x\"\n");
+-    let ascii_loc = write_file(&root, "localisation/plain_l_english.yml", b"l_english:\n");
+-    let whole_bytes = encode_file(READABLE_LOC, Profile::Localisation, EscapeSet::Paratranz)
+-        .expect("whole-encoded fixture");
+-
++    let script = write_file(&root, "events/plain.txt", b"name = \"x\"\n");
++    let loc = write_file(&root, "localisation/plain.yml", b"l_english:\n");
+     let run = run_transcode_session(
+         &root,
+         &root_uri,
+         json!({}),
+         vec![
+-            // Unsaved readable buffer over the ASCII script file: judged as
+-            // plain with quoted CJK a save would encode.
+-            decode_request_with_bytes(&ascii_script, READABLE_SCRIPT.as_bytes()),
+-            // Unsaved readable buffer with CJK only outside the quoted span:
+-            // plain and a fixed point again.
+-            decode_request_with_bytes(&ascii_script, "# 中文注释\nname = \"x\"\n".as_bytes()),
+-            // Unsaved already-escaped buffer: classified and decoded as whole.
+-            decode_request_with_bytes(&ascii_loc, &whole_bytes),
+-            // Without `bytes` the on-disk content still decides.
+-            decode_request(&ascii_script),
+-            // Malformed hex is a protocol error, not a classification.
++            encode_request(&script, "# 😀\nname = \"x\"\n".as_bytes()),
++            encode_request(&script, b"# \x10\n"),
++            decode_request_with_bytes(&script, b"# \x10\n"),
++            encode_request(&loc, b"# \xff\nname = \"x\"\n"),
++            decode_request_with_bytes(&loc, b"# \xff\n"),
+             json!({"method":"pdc/transcodeDecode","params":{
+-                "path":ascii_script.to_string_lossy(),
+-                "bytes":"abc",
+-            }}),
++            "path":script.to_string_lossy(), "quotedOnly":true}}),
++            json!({"method":"pdc/transcodeEncode","params":{
++            "path":script.to_string_lossy(), "bytes":"", "preserveEscaped":true}}),
+         ],
+     );
+-
+-    let result = run.result(2);
+-    assert_eq!(result["form"], json!("plain"));
+-    assert_eq!(result["quotedCjk"], json!(true));
+-    assert_eq!(result["bytes"], json!(hex(READABLE_SCRIPT.as_bytes())));
+-
+-    let result = run.result(3);
+-    assert_eq!(result["form"], json!("plain"));
+-    assert_eq!(result["quotedCjk"], json!(false));
++    assert_eq!(run.result(2)["refused"], "unencodable");
++    assert!(run.result(2).get("bytes").is_none());
++    assert_eq!(run.result(3)["refused"], "brokenEscape");
++    assert_eq!(run.result(3)["offsets"], json!([2]));
++    assert!(run.result(3).get("bytes").is_none());
++    assert_eq!(run.result(4)["form"], "damaged");
++    assert_eq!(run.result(4)["refused"], "brokenEscape");
+     assert_eq!(
+-        result["bytes"],
+-        json!(hex("# 中文注释\nname = \"x\"\n".as_bytes()))
++        run.result(4)["bytes"],
++        hex(b"# \x10\n"),
++        "only original bytes are returned for repair"
+     );
+-
+-    let result = run.result(4);
+-    assert_eq!(result["profile"], json!("localisation"));
+-    assert_eq!(result["form"], json!("whole"));
+-    assert_eq!(result["bytes"], json!(hex(READABLE_LOC.as_bytes())));
+-
+-    let result = run.result(5);
+-    assert_eq!(result["form"], json!("plain"));
+-    assert_eq!(result["quotedCjk"], json!(false));
+-    assert_eq!(result["bytes"], json!(hex(b"name = \"x\"\n")));
+-
+-    assert_eq!(run.error(6)["code"], json!(-32602));
+-
++    assert_eq!(run.result(5)["refused"], "invalidUtf8");
++    assert_eq!(run.result(6)["refused"], "invalidUtf8");
++    assert_eq!(run.error(7)["code"], -32602, "removed options are rejected");
++    assert_eq!(run.error(8)["code"], -32602);
+     fs::remove_dir_all(root).expect("cleanup");
+ }
+ 
+ #[test]
+-fn transcode_decode_accepts_pdcloc_uris_and_rejects_relative_paths() {
++fn transcode_buffer_precedence_and_path_eligibility_are_preserved() {
+     let (root, root_uri) = temp_workspace_dir();
+-    let plain = write_file(&root, "events/plain.txt", READABLE_SCRIPT.as_bytes());
+-    let pdcloc_uri = FileUri::parse(&file_uri_string(&plain).replacen("file:", "pdcloc:", 1))
+-        .expect("pdcloc URI parses")
+-        .as_str()
+-        .to_owned();
+-
+-    let run = run_transcode_session(
+-        &root,
+-        &root_uri,
+-        json!({}),
+-        vec![
+-            json!({"method":"pdc/transcodeDecode","params":{"path":pdcloc_uri}}),
+-            json!({"method":"pdc/transcodeDecode","params":{"path":"events/plain.txt"}}),
+-        ],
+-    );
+-
+-    let result = run.result(2);
+-    assert_eq!(result["form"], json!("plain"));
+-    assert_eq!(result["bytes"], json!(hex(READABLE_SCRIPT.as_bytes())));
+-    assert_eq!(run.error(3)["code"], json!(-32602));
+-
+-    fs::remove_dir_all(root).expect("cleanup");
+-}
+-
+-#[test]
+-fn transcode_encode_round_trips_and_refuses_the_three_guards() {
+-    let (root, root_uri) = temp_workspace_dir();
+-    let file = write_file(&root, "events/draft.txt", b"");
+-    let loc_file = write_file(&root, "localisation/draft_l_english.yml", b"");
+-
++    let script = write_file(&root, "events/plain.txt", b"name = \"x\"\n");
++    let markdown = write_file(&root, "docs/readme.md", b"# readme\n");
+     let run = run_transcode_session(
+         &root,
+         &root_uri,
+         json!({}),
+         vec![
+-            encode_request(&file, READABLE_SCRIPT.as_bytes()),
+-            // Iron rule ②: an escape marker inside a quoted string would double-encode.
+-            encode_request(&file, b"name = \"\x10abc\"\n"),
+-            // Beyond-BMP character inside a quoted string cannot round-trip.
+-            encode_request(&file, "name = \"😀\"\n".as_bytes()),
+-            // The editor buffer must be valid UTF-8.
+-            encode_request(&file, b"\xff\xfe"),
+-            // Localisation profile takes the whole-file encoder.
+-            encode_request(&loc_file, READABLE_LOC.as_bytes()),
++            decode_request(&script),
++            decode_request_with_bytes(&script, READABLE_SCRIPT.as_bytes()),
++            decode_request(&markdown),
++            json!({"method":"pdc/transcodeDecode","params":{
++            "path":script.to_string_lossy(), "bytes":"abc"}}),
+         ],
+     );
+-
+-    let encoded = hex(
+-        &scoped_encode_file(READABLE_SCRIPT, Profile::Script, EscapeSet::Paratranz)
+-            .expect("expected scoped bytes"),
+-    );
+-    assert_eq!(run.result(2), &json!({"bytes": encoded}));
+-
+-    let refused = run.result(3);
+-    assert_eq!(refused["refused"], json!("alreadyEscaped"));
+-    assert_eq!(refused["offsets"], json!([8]));
+-
+-    let refused = run.result(4);
+-    assert_eq!(refused["refused"], json!("unencodable"));
+-    let points = refused["points"].as_array().expect("unencodable points");
+-    assert_eq!(points.len(), 1);
+-    assert_eq!(points[0]["codePoint"], json!(0x1F600));
+-
+-    assert_eq!(run.result(5), &json!({"refused": "invalidUtf8"}));
+-
+-    let encoded_loc = hex(
+-        &encode_file(READABLE_LOC, Profile::Localisation, EscapeSet::Paratranz)
+-            .expect("expected whole bytes"),
+-    );
+-    assert_eq!(run.result(6), &json!({"bytes": encoded_loc}));
+-
++    assert_eq!(run.result(2)["needsEncoding"], false);
++    assert_eq!(run.result(3)["bytes"], hex(READABLE_SCRIPT.as_bytes()));
++    assert_eq!(run.result(3)["needsEncoding"], true);
++    assert_eq!(run.result(4)["eligible"], false);
++    assert_eq!(run.error(5)["code"], -32602);
+     fs::remove_dir_all(root).expect("cleanup");
+ }
+ 
+diff --git a/crates/transcode/src/classify.rs b/crates/transcode/src/classify.rs
+index 87c2742..5698408 100644
+--- a/crates/transcode/src/classify.rs
++++ b/crates/transcode/src/classify.rs
+@@ -1,12 +1,12 @@
+-//! The no-double-transcode gate: decides whether a buffer is readable text, escaped
+-//! text, a mix of both, or a transformation-free fixed point, before any encode or
+-//! decode is allowed to run.
++//! Content classification for analysis and legacy whole-escaped detection.
++//! Whole-file buffer conversion validates each triple directly, supports readable
++//! and escaped mixtures, and does not require the legacy triple-count threshold.
+ 
+ use crate::Profile;
+ use crate::cp1252;
+ 
+-/// Content classification of a buffer. Every transformation entry point must check
+-/// this first: encode only accepts `Readable`/`Ascii`, decode only accepts `Escaped`.
++/// Content classification of a buffer. The idempotent whole-file buffer APIs
++/// independently validate input and accept valid mixtures without double encoding.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub enum Classification {
+     /// Raw CJK text that the game cannot display as-is. Encode (never decode).
+diff --git a/crates/transcode/src/file.rs b/crates/transcode/src/file.rs
+new file mode 100644
+index 0000000..49de627
+--- /dev/null
++++ b/crates/transcode/src/file.rs
+@@ -0,0 +1,329 @@
++//! Idempotent whole-file conversion, including comments, identifiers and strings.
++//! Existing escape triples are preserved by encoding; readable runs are preserved
++//! by decoding. Mixed legacy script bytes and readable UTF-8 are handled per run.
++
++use crate::{EncodeError, EscapeSet, Profile, cp1252, encode_file};
++
++/// A whole-file conversion cannot safely transform the input.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum FileConversionError {
++    /// A localisation file is not valid UTF-8.
++    InvalidUtf8,
++    /// A marker has a truncated, structural, or invalid-code-point payload.
++    BrokenEscape { byte_index: usize },
++    /// Readable content contains characters the encoder cannot round-trip.
++    Unencodable { error: EncodeError },
++}
++
++#[derive(Clone, Copy)]
++enum Direction {
++    Encode(EscapeSet),
++    Decode,
++}
++
++/// Encodes every readable run, preserving valid existing triples byte-for-byte.
++/// No syntax or quote boundary limits conversion.
++///
++/// # Errors
++/// Refuses the complete file on invalid UTF-8, damaged triples or unencodable text.
++pub fn encode_buffer(
++    input: &[u8],
++    profile: Profile,
++    escape_set: EscapeSet,
++) -> Result<Vec<u8>, FileConversionError> {
++    convert(input, profile, Direction::Encode(escape_set))
++}
++
++/// Decodes every escape triple, including comments and unquoted text. Plain UTF-8
++/// runs retain their bytes; legacy script bytes are converted through CP1252.
++///
++/// # Errors
++/// Refuses the complete file on invalid localisation UTF-8 or damaged triples.
++pub fn decode_buffer(input: &[u8], profile: Profile) -> Result<Vec<u8>, FileConversionError> {
++    convert(input, profile, Direction::Decode)
++}
++
++fn convert(
++    input: &[u8],
++    profile: Profile,
++    direction: Direction,
++) -> Result<Vec<u8>, FileConversionError> {
++    if profile == Profile::Localisation && std::str::from_utf8(input).is_err() {
++        return Err(FileConversionError::InvalidUtf8);
++    }
++    let mut output = Vec::with_capacity(input.len());
++    let mut index = 0;
++    while index < input.len() {
++        if (0x10..=0x13).contains(&input[index]) {
++            let (next, character) = escape_at(input, index, input.len(), profile)?;
++            match direction {
++                Direction::Encode(_) => output.extend_from_slice(&input[index..next]),
++                Direction::Decode => {
++                    let mut encoded = [0; 4];
++                    output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
++                }
++            }
++            index = next;
++        } else {
++            let next = input[index..]
++                .iter()
++                .position(|byte| (0x10..=0x13).contains(byte))
++                .map_or(input.len(), |offset| index + offset);
++            let run = &input[index..next];
++            match direction {
++                Direction::Encode(escape_set) => {
++                    encode_run(run, profile, escape_set, index, &mut output)?;
++                }
++                Direction::Decode => decode_run(run, &mut output),
++            }
++            index = next;
++        }
++    }
++    Ok(output)
++}
++
++fn decode_run(mut input: &[u8], output: &mut Vec<u8>) {
++    while !input.is_empty() {
++        match std::str::from_utf8(input) {
++            Ok(_) => {
++                output.extend_from_slice(input);
++                break;
++            }
++            Err(error) => {
++                let prefix = error.valid_up_to();
++                output.extend_from_slice(&input[..prefix]);
++                let width = error.error_len().unwrap_or(input.len() - prefix);
++                for byte in &input[prefix..prefix + width] {
++                    let character = char::from_u32(cp1252::byte_to_char(*byte))
++                        .expect("CP1252 maps each byte to a scalar");
++                    let mut encoded = [0; 4];
++                    output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
++                }
++                input = &input[prefix + width..];
++            }
++        }
++    }
++}
++
++fn escape_at(
++    input: &[u8],
++    start: usize,
++    end: usize,
++    profile: Profile,
++) -> Result<(usize, char), FileConversionError> {
++    let broken = || FileConversionError::BrokenEscape { byte_index: start };
++    let (triple_end, low, high) = match profile {
++        Profile::Script => {
++            if end - start < 3 {
++                return Err(broken());
++            }
++            (start + 3, input[start + 1], input[start + 2])
++        }
++        Profile::Localisation => {
++            let (low_end, low) = payload_character(input, start + 1, end).ok_or_else(broken)?;
++            let (high_end, high) = payload_character(input, low_end, end).ok_or_else(broken)?;
++            (high_end, low, high)
++        }
++    };
++    // A valid triple never consumes an escape-set structural byte, including
++    // quote, comment, whitespace and line boundaries.
++    if [low, high]
++        .iter()
++        .any(|byte| crate::EscapeSet::Paratranz.contains(*byte))
++    {
++        return Err(broken());
++    }
++    let code_point = crate::escape::reconstruct(u32::from(input[start]), low, high);
++    // Escape triples represent four-digit code points; ASCII/Latin-1 and
++    // lower-plane characters cannot legitimately be emitted as these triples.
++    if !(0x1000..=0xFFFF).contains(&code_point) {
++        return Err(broken());
++    }
++    let character = char::from_u32(code_point).ok_or_else(broken)?;
++    Ok((triple_end, character))
++}
++
++fn payload_character(input: &[u8], start: usize, end: usize) -> Option<(usize, u8)> {
++    let first = *input.get(start).filter(|_| start < end)?;
++    let width = match first {
++        0..=0x7F => 1,
++        0xC2..=0xDF => 2,
++        0xE0..=0xEF => 3,
++        0xF0..=0xF4 => 4,
++        _ => return None,
++    };
++    let next = start + width;
++    if next > end {
++        return None;
++    }
++    let character = std::str::from_utf8(&input[start..next])
++        .ok()?
++        .chars()
++        .next()?;
++    let code_point = u32::from(character);
++    let byte = if code_point < 0x100 {
++        code_point as u8
++    } else {
++        cp1252::mapped_byte(code_point)?
++    };
++    Some((next, byte))
++}
++
++fn encode_run(
++    mut input: &[u8],
++    profile: Profile,
++    escape_set: EscapeSet,
++    mut base: usize,
++    output: &mut Vec<u8>,
++) -> Result<(), FileConversionError> {
++    while !input.is_empty() {
++        let (readable, legacy) = match std::str::from_utf8(input) {
++            Ok(text) => (text, 0),
++            Err(error) if profile == Profile::Script => {
++                // Readable UTF-8 and legacy CP1252 bytes may share a run.
++                // Convert valid UTF-8 portions and preserve already-single-byte
++                // characters instead of interpreting the entire run as CP1252.
++                let prefix = error.valid_up_to();
++                let text = std::str::from_utf8(&input[..prefix]).expect("validated UTF-8 prefix");
++                let legacy = error.error_len().unwrap_or(input.len() - prefix);
++                (text, legacy)
++            }
++            Err(_) => return Err(FileConversionError::InvalidUtf8),
++        };
++        let encoded = encode_file(readable, profile, escape_set).map_err(|mut error| {
++            for point in &mut error.unencodable {
++                point.byte_index += base;
++            }
++            FileConversionError::Unencodable { error }
++        })?;
++        output.extend_from_slice(&encoded);
++        let consumed = readable.len() + legacy;
++        output.extend_from_slice(&input[readable.len()..consumed]);
++        base += consumed;
++        input = &input[consumed..];
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn complete_files_match_the_canonical_codec_and_round_trip() {
++        let readable = "\u{FEFF}# 中文注释\r\n中文标识 = 中文值\r\nname = \"中文内容\"\r\n";
++        for profile in [Profile::Script, Profile::Localisation] {
++            let encoded = encode_buffer(readable.as_bytes(), profile, EscapeSet::Paratranz)
++                .expect("whole-file encoding");
++            assert_eq!(
++                encoded,
++                encode_file(readable, profile, EscapeSet::Paratranz).unwrap()
++            );
++            assert_eq!(
++                decode_buffer(&encoded, profile).unwrap(),
++                readable.as_bytes()
++            );
++            assert_eq!(
++                encode_buffer(&encoded, profile, EscapeSet::Paratranz).unwrap(),
++                encoded
++            );
++            assert_eq!(
++                decode_buffer(readable.as_bytes(), profile).unwrap(),
++                readable.as_bytes()
++            );
++        }
++    }
++
++    #[test]
++    fn mixed_files_converge_across_comments_identifiers_and_strings() {
++        for profile in [Profile::Script, Profile::Localisation] {
++            let escaped = encode_file("中", profile, EscapeSet::DllFull).unwrap();
++            let mut mixed = b"# ".to_vec();
++            mixed.extend_from_slice(&escaped);
++            mixed.extend_from_slice("文\n中文 = \"".as_bytes());
++            mixed.extend_from_slice(&escaped);
++            mixed.extend_from_slice("文\"\n".as_bytes());
++            let decoded = "# 中文\n中文 = \"中文\"\n";
++            assert_eq!(decode_buffer(&mixed, profile).unwrap(), decoded.as_bytes());
++            let encoded = encode_buffer(&mixed, profile, EscapeSet::Paratranz).unwrap();
++            assert_eq!(
++                decode_buffer(&encoded, profile).unwrap(),
++                decoded.as_bytes()
++            );
++            assert_eq!(
++                encode_buffer(&encoded, profile, EscapeSet::Paratranz).unwrap(),
++                encoded
++            );
++        }
++    }
++
++    #[test]
++    fn even_one_unquoted_escape_is_decoded_without_a_threshold() {
++        for profile in [Profile::Script, Profile::Localisation] {
++            let encoded = encode_file("# 中\n", profile, EscapeSet::Paratranz).unwrap();
++            assert_eq!(
++                decode_buffer(&encoded, profile).unwrap(),
++                "# 中\n".as_bytes()
++            );
++        }
++    }
++
++    #[test]
++    fn comments_and_bare_text_have_the_same_refusals_as_strings() {
++        for text in ["# 😀\n", "value = 😀\n", "name = \"😀\"\n"] {
++            assert!(matches!(
++                encode_buffer(text.as_bytes(), Profile::Script, EscapeSet::Paratranz),
++                Err(FileConversionError::Unencodable { .. })
++            ));
++        }
++        for bytes in [
++            b"# \x10\n".as_slice(),
++            b"name = \"\x10\"\n".as_slice(),
++            b"\x10".as_slice(),
++        ] {
++            let offset = bytes.iter().position(|byte| *byte == 0x10).unwrap();
++            for profile in [Profile::Script, Profile::Localisation] {
++                assert_eq!(
++                    decode_buffer(bytes, profile),
++                    Err(FileConversionError::BrokenEscape { byte_index: offset })
++                );
++                assert_eq!(
++                    encode_buffer(bytes, profile, EscapeSet::Paratranz),
++                    Err(FileConversionError::BrokenEscape { byte_index: offset })
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn localisation_utf8_is_checked_outside_strings_too() {
++        for bytes in [
++            b"# \xff\nname = \"x\"\n".as_slice(),
++            b"\xff = x\n".as_slice(),
++        ] {
++            assert_eq!(
++                decode_buffer(bytes, Profile::Localisation),
++                Err(FileConversionError::InvalidUtf8)
++            );
++            assert_eq!(
++                encode_buffer(bytes, Profile::Localisation, EscapeSet::Paratranz),
++                Err(FileConversionError::InvalidUtf8)
++            );
++        }
++    }
++
++    #[test]
++    fn script_legacy_bytes_and_readable_utf8_share_a_complete_file() {
++        let bytes = [b"# K\xf6nig ".as_slice(), "中文\nname = \"é\"\n".as_bytes()].concat();
++        let readable = "# König 中文\nname = \"é\"\n";
++        assert_eq!(
++            decode_buffer(&bytes, Profile::Script).unwrap(),
++            readable.as_bytes()
++        );
++        let encoded = encode_buffer(&bytes, Profile::Script, EscapeSet::Paratranz).unwrap();
++        assert_eq!(
++            decode_buffer(&encoded, Profile::Script).unwrap(),
++            readable.as_bytes()
++        );
++    }
++}
+diff --git a/crates/transcode/src/lib.rs b/crates/transcode/src/lib.rs
+index c640ab6..35e8908 100644
+--- a/crates/transcode/src/lib.rs
++++ b/crates/transcode/src/lib.rs
+@@ -18,8 +18,8 @@
+ //!   variants all decode correctly regardless of the configured [`EscapeSet`].
+ //! * Encoding rejects code points the ecosystem cannot round-trip (`U+0100..=U+0FFF`
+ //!   and `U+10000+`) with a structured [`EncodeError`] instead of silently mangling.
+-//! * [`classify_file`] gates every transformation so escaped text is never encoded twice
+-//!   and readable text is never decoded.
++//! * [`encode_buffer`] / [`decode_buffer`] convert the entire file, preserve already
++//!   converted runs, and reject damaged escape triples before producing any output.
+ //!
+ //! Algorithm provenance: `matanki-saito/EU4SpecialEscape` (MIT) via the paratranz
+ //! official gist `special-escape.js`; calibrated byte-for-byte against the deployed
+@@ -28,8 +28,7 @@
+ mod classify;
+ mod cp1252;
+ mod escape;
+-mod quoted;
+-mod scoped;
++mod file;
+ 
+ pub use classify::{
+     Classification, ClassificationCounts, classify_file, classify_text, classify_text_counts,
+@@ -40,16 +39,12 @@ pub use escape::{
+     Decoded, InvalidUtf8, decode_file, decode_text, decode_value, encode_file, encode_text,
+     file_unencodable_kind, script_roundtrip_is_canonical, unencodable_kind,
+ };
+-pub use quoted::{QuotedConversionError, decode_quoted_file, encode_quoted_file};
+-pub use scoped::{
+-    ScopedDecoded, ScopedEncodeError, ScopedForm, marker_outside_spans, scan_string_spans,
+-    scoped_decode_file, scoped_encode_file, scoped_form,
+-};
++pub use file::{FileConversionError, decode_buffer, encode_buffer};
+ 
+ /// Bumped whenever encoding output for identical input changes (escape set adjustments,
+ /// compensation fixes). Consumers that persist decoded text (index caches, previews)
+ /// must invalidate their entries when this value changes.
+-pub const TRANSCODE_VERSION: u32 = 1;
++pub const TRANSCODE_VERSION: u32 = 2;
+ 
+ /// Selects the byte-level shape of escaped content: BOM/CRLF yml files versus raw
+ /// single-byte script files. See the crate docs for the exact differences.
+diff --git a/crates/transcode/src/quoted.rs b/crates/transcode/src/quoted.rs
+deleted file mode 100644
+index e350d0b..0000000
+--- a/crates/transcode/src/quoted.rs
++++ /dev/null
+@@ -1,194 +0,0 @@
+-//! Idempotent manual conversion of quoted content in partially transcoded files.
+-//! Existing escape triples are copied verbatim by encoding; decoding only replaces
+-//! those triples. Every byte outside quoted strings, including comments, is preserved.
+-
+-use crate::{EncodeError, EscapeSet, Profile, cp1252, encode_file, scan_string_spans};
+-
+-/// A manual conversion cannot safely transform one quoted fragment.
+-#[derive(Clone, Debug, PartialEq, Eq)]
+-pub enum QuotedConversionError {
+-    /// A localisation string is not valid UTF-8.
+-    InvalidUtf8,
+-    /// A marker has a truncated, structural, or invalid-code-point payload.
+-    BrokenEscape { byte_index: usize },
+-    /// Readable content contains characters the encoder cannot round-trip.
+-    Unencodable { error: EncodeError },
+-}
+-
+-#[derive(Clone, Copy)]
+-enum Direction {
+-    Encode(EscapeSet),
+-    Decode,
+-}
+-
+-/// Encodes only readable quoted fragments, preserving existing escape triples
+-/// byte-for-byte, including triples from other supported escape-set variants.
+-/// Comments and all other unquoted bytes are copied without interpretation.
+-///
+-/// # Errors
+-/// Returns [`QuotedConversionError`] for invalid or unencodable quoted content.
+-pub fn encode_quoted_file(
+-    input: &[u8],
+-    profile: Profile,
+-    escape_set: EscapeSet,
+-) -> Result<Vec<u8>, QuotedConversionError> {
+-    convert(input, profile, Direction::Encode(escape_set))
+-}
+-
+-/// Decodes only escape triples inside quoted strings. Readable fragments and
+-/// comments retain their original bytes; no whole-file classification is used.
+-///
+-/// # Errors
+-/// Returns [`QuotedConversionError`] for invalid quoted UTF-8 or escape triples.
+-pub fn decode_quoted_file(
+-    input: &[u8],
+-    profile: Profile,
+-) -> Result<Vec<u8>, QuotedConversionError> {
+-    convert(input, profile, Direction::Decode)
+-}
+-
+-fn convert(
+-    input: &[u8],
+-    profile: Profile,
+-    direction: Direction,
+-) -> Result<Vec<u8>, QuotedConversionError> {
+-    let mut output = Vec::with_capacity(input.len());
+-    let mut cursor = 0;
+-    for (start, end) in scan_string_spans(input) {
+-        output.extend_from_slice(&input[cursor..start]);
+-        let span = &input[start..end];
+-        if profile == Profile::Localisation && std::str::from_utf8(span).is_err() {
+-            return Err(QuotedConversionError::InvalidUtf8);
+-        }
+-        let mut index = start;
+-        while index < end {
+-            if (0x10..=0x13).contains(&input[index]) {
+-                let (triple_end, character) = escape_at(input, index, end, profile)?;
+-                match direction {
+-                    Direction::Encode(_) => output.extend_from_slice(&input[index..triple_end]),
+-                    Direction::Decode => {
+-                        let mut encoded = [0; 4];
+-                        output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+-                    }
+-                }
+-                index = triple_end;
+-            } else {
+-                let run_end = input[index..end]
+-                    .iter()
+-                    .position(|byte| (0x10..=0x13).contains(byte))
+-                    .map_or(end, |offset| index + offset);
+-                let run = &input[index..run_end];
+-                match direction {
+-                    Direction::Encode(escape_set) => {
+-                        encode_run(run, profile, escape_set, index, &mut output)?;
+-                    }
+-                    Direction::Decode => output.extend_from_slice(run),
+-                }
+-                index = run_end;
+-            }
+-        }
+-        cursor = end;
+-    }
+-    output.extend_from_slice(&input[cursor..]);
+-    Ok(output)
+-}
+-
+-fn escape_at(
+-    input: &[u8],
+-    start: usize,
+-    end: usize,
+-    profile: Profile,
+-) -> Result<(usize, char), QuotedConversionError> {
+-    let broken = || QuotedConversionError::BrokenEscape { byte_index: start };
+-    let (triple_end, low, high) = match profile {
+-        Profile::Script => {
+-            if end - start < 3 {
+-                return Err(broken());
+-            }
+-            (start + 3, input[start + 1], input[start + 2])
+-        }
+-        Profile::Localisation => {
+-            let (low_end, low) = payload_character(input, start + 1, end).ok_or_else(broken)?;
+-            let (high_end, high) = payload_character(input, low_end, end).ok_or_else(broken)?;
+-            (high_end, low, high)
+-        }
+-    };
+-    // A valid triple never consumes a quote, escape, or line boundary. In
+-    // particular, a marker before the closing quote must not eat that quote.
+-    if [low, high]
+-        .iter()
+-        .any(|byte| matches!(byte, b'"' | b'\\' | b'\r' | b'\n'))
+-    {
+-        return Err(broken());
+-    }
+-    let code_point = crate::escape::reconstruct(u32::from(input[start]), low, high);
+-    // Escape triples represent four-digit code points; ASCII/Latin-1 and
+-    // lower-plane characters cannot legitimately be emitted as these triples.
+-    if !(0x1000..=0xFFFF).contains(&code_point) {
+-        return Err(broken());
+-    }
+-    let character = char::from_u32(code_point).ok_or_else(broken)?;
+-    Ok((triple_end, character))
+-}
+-
+-fn payload_character(input: &[u8], start: usize, end: usize) -> Option<(usize, u8)> {
+-    let first = *input.get(start).filter(|_| start < end)?;
+-    let width = match first {
+-        0..=0x7F => 1,
+-        0xC2..=0xDF => 2,
+-        0xE0..=0xEF => 3,
+-        0xF0..=0xF4 => 4,
+-        _ => return None,
+-    };
+-    let next = start + width;
+-    if next > end {
+-        return None;
+-    }
+-    let character = std::str::from_utf8(&input[start..next])
+-        .ok()?
+-        .chars()
+-        .next()?;
+-    let code_point = u32::from(character);
+-    let byte = if code_point < 0x100 {
+-        code_point as u8
+-    } else {
+-        cp1252::mapped_byte(code_point)?
+-    };
+-    Some((next, byte))
+-}
+-
+-fn encode_run(
+-    mut input: &[u8],
+-    profile: Profile,
+-    escape_set: EscapeSet,
+-    mut base: usize,
+-    output: &mut Vec<u8>,
+-) -> Result<(), QuotedConversionError> {
+-    while !input.is_empty() {
+-        let (readable, legacy) = match std::str::from_utf8(input) {
+-            Ok(text) => (text, 0),
+-            Err(error) if profile == Profile::Script => {
+-                // Readable UTF-8 and legacy CP1252 bytes may share a run.
+-                // Convert valid UTF-8 portions and preserve already-single-byte
+-                // characters instead of interpreting the entire run as CP1252.
+-                let prefix = error.valid_up_to();
+-                let text = std::str::from_utf8(&input[..prefix]).expect("validated UTF-8 prefix");
+-                let legacy = error.error_len().unwrap_or(input.len() - prefix);
+-                (text, legacy)
+-            }
+-            Err(_) => return Err(QuotedConversionError::InvalidUtf8),
+-        };
+-        let encoded = encode_file(readable, profile, escape_set).map_err(|mut error| {
+-            for point in &mut error.unencodable {
+-                point.byte_index += base;
+-            }
+-            QuotedConversionError::Unencodable { error }
+-        })?;
+-        output.extend_from_slice(&encoded);
+-        let consumed = readable.len() + legacy;
+-        output.extend_from_slice(&input[readable.len()..consumed]);
+-        base += consumed;
+-        input = &input[consumed..];
+-    }
+-    Ok(())
+-}
+diff --git a/crates/transcode/src/scoped.rs b/crates/transcode/src/scoped.rs
+deleted file mode 100644
+index bd676e7..0000000
+--- a/crates/transcode/src/scoped.rs
++++ /dev/null
+@@ -1,528 +0,0 @@
+-//! Quote/comment-scoped transcoding: escape triples live only inside quoted
+-//! strings, everything else (comments, code) stays readable.
+-//!
+-//! The transparent editor workflow shows readable text everywhere and encodes
+-//! on save; whole-file encoding would escape comment CJK too, turning every
+-//! other editor's view of the comments into mojibake. Scoped files therefore
+-//! carry two byte shapes in one stream: escaped strings (the profile's usual
+-//! form — CP1252-mapped triple payloads for scripts, UTF-8 triple characters
+-//! for localisation) and verbatim UTF-8 outside strings.
+-//!
+-//! The scanner is deliberately encoding-blind. Structural bytes (`"`, `#`,
+-//! `\n`, `\`) are ASCII, and every one of them is an escape-set member, so
+-//! triple payloads never contain them — scanning raw bytes yields the same
+-//! spans as scanning text, and the spans are stable across encode/decode,
+-//! which is what closes the round trip.
+-
+-use crate::cp1252;
+-use crate::escape::{decode_file, encode_file};
+-use crate::{Classification, EncodeError, EscapeSet, Profile, classify_file};
+-
+-/// Maximal quoted spans outside comments: byte ranges including the quotes,
+-/// over the scanned buffer. Strings never span lines; an unterminated quote
+-/// closes at end of line (or end of input). `#` inside a string is literal
+-/// text, `\"` never closes a string.
+-#[must_use]
+-pub fn scan_string_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+-    let mut spans = Vec::new();
+-    let mut in_string = false;
+-    let mut start = 0usize;
+-    let mut index = 0usize;
+-    while index < bytes.len() {
+-        let byte = bytes[index];
+-        if in_string {
+-            if byte == b'\\' && index + 1 < bytes.len() {
+-                index += 2;
+-                continue;
+-            }
+-            if byte == b'"' {
+-                spans.push((start, index + 1));
+-                in_string = false;
+-            } else if byte == b'\n' {
+-                spans.push((start, index));
+-                in_string = false;
+-            }
+-        } else if byte == b'#' {
+-            while index < bytes.len() && bytes[index] != b'\n' {
+-                index += 1;
+-            }
+-            continue;
+-        } else if byte == b'"' {
+-            in_string = true;
+-            start = index;
+-        }
+-        index += 1;
+-    }
+-    if in_string {
+-        spans.push((start, bytes.len()));
+-    }
+-    spans
+-}
+-
+-/// How a buffer relates to the scoped form.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+-pub enum ScopedForm {
+-    /// Readable or ASCII with no escape markers: show as-is; a save encodes
+-    /// quoted CJK (if any) into the scoped form.
+-    Plain,
+-    /// Whole-file escaped (legacy form): the whole-file decoder applies.
+-    WholeEscaped,
+-    /// Escape triples confined to quoted spans: the scoped decoder applies.
+-    /// Readable CJK may share the spans — a save converges them to escaped.
+-    Scoped,
+-    /// Escape markers outside any quoted span: damaged content, refuse to
+-    /// transform and report.
+-    Damaged,
+-}
+-
+-/// Dispatch for a buffer under scoped semantics.
+-///
+-/// The decisive signal is the comment gap: a scoped file holds readable
+-/// UTF-8 CJK between its string spans, which the CP1252 byte layer of a
+-/// legacy escaped file can never produce (escaped comments are triples).
+-/// Files without that signal — ASCII/readable gaps, or fully escaped ones —
+-/// keep the legacy whole-file path, whose decode result is identical for
+-/// them anyway.
+-#[must_use]
+-pub fn scoped_form(bytes: &[u8], profile: Profile) -> ScopedForm {
+-    match classify_file(bytes, profile) {
+-        Classification::Ascii | Classification::Readable => ScopedForm::Plain,
+-        Classification::Escaped => {
+-            if readable_cjk_gap(bytes) {
+-                ScopedForm::Scoped
+-            } else {
+-                ScopedForm::WholeEscaped
+-            }
+-        }
+-        Classification::Mixed => {
+-            if readable_cjk_gap(bytes) {
+-                return ScopedForm::Scoped;
+-            }
+-            // Localisation input that is not valid UTF-8 can never decode;
+-            // report it as damaged instead of a form the decoder refuses.
+-            if profile == Profile::Localisation && std::str::from_utf8(bytes).is_err() {
+-                return ScopedForm::Damaged;
+-            }
+-            if marker_outside_spans(bytes).is_empty() {
+-                ScopedForm::Scoped
+-            } else {
+-                ScopedForm::Damaged
+-            }
+-        }
+-    }
+-}
+-
+-/// Whether any between-spans run is unescaped, valid UTF-8, and contains raw
+-/// CJK — the fingerprint of readable scoped comments.
+-fn readable_cjk_gap(bytes: &[u8]) -> bool {
+-    let spans = scan_string_spans(bytes);
+-    let mut cursor = 0usize;
+-    for &(start, end) in &spans {
+-        if gap_is_readable_cjk(&bytes[cursor..start]) {
+-            return true;
+-        }
+-        cursor = end;
+-    }
+-    gap_is_readable_cjk(&bytes[cursor..])
+-}
+-
+-fn gap_is_readable_cjk(gap: &[u8]) -> bool {
+-    if gap.is_empty() || gap.iter().any(|byte| is_marker(*byte)) {
+-        return false;
+-    }
+-    match std::str::from_utf8(gap) {
+-        Ok(text) => text
+-            .chars()
+-            .any(|character| crate::is_raw_cjk(u32::from(character))),
+-        Err(_) => false,
+-    }
+-}
+-
+-/// Input byte offsets of escape markers that sit outside every quoted span,
+-/// computed by walking the gaps between spans linearly.
+-#[must_use]
+-pub fn marker_outside_spans(bytes: &[u8]) -> Vec<usize> {
+-    let spans = scan_string_spans(bytes);
+-    let mut markers = Vec::new();
+-    let mut cursor = 0usize;
+-    for &(start, end) in &spans {
+-        for (offset, byte) in bytes[cursor..start].iter().enumerate() {
+-            if is_marker(*byte) {
+-                markers.push(cursor + offset);
+-            }
+-        }
+-        cursor = end;
+-    }
+-    for (offset, byte) in bytes[cursor..].iter().enumerate() {
+-        if is_marker(*byte) {
+-            markers.push(cursor + offset);
+-        }
+-    }
+-    markers
+-}
+-
+-/// Successful scoped decode: readable text plus the input byte offsets of
+-/// markers that were not resolved — orphans inside spans (passed through) and
+-/// markers outside spans (damage evidence).
+-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+-pub struct ScopedDecoded {
+-    /// The decoded readable text.
+-    pub text: String,
+-    /// Input byte offsets of orphan markers inside quoted spans.
+-    pub in_span_broken: Vec<usize>,
+-    /// Input byte offsets of markers outside any quoted span.
+-    pub out_of_span_markers: Vec<usize>,
+-}
+-
+-/// Decodes a scoped-escaped buffer: escape triples resolve only inside quoted
+-/// spans; a segment without markers reads as verbatim UTF-8 when valid (scoped
+-/// comments and not-yet-encoded strings hold readable UTF-8 CJK) and falls
+-/// back to the CP1252 character layer otherwise, matching files written by
+-/// foreign tools.
+-///
+-/// # Errors
+-/// Returns [`InvalidUtf8`](crate::InvalidUtf8) only for the localisation
+-/// profile when the file is not valid UTF-8; the script profile never fails.
+-pub fn scoped_decode_file(
+-    bytes: &[u8],
+-    profile: Profile,
+-) -> Result<ScopedDecoded, crate::InvalidUtf8> {
+-    if profile == Profile::Localisation && std::str::from_utf8(bytes).is_err() {
+-        return Err(crate::InvalidUtf8);
+-    }
+-    let spans = scan_string_spans(bytes);
+-    let mut text = String::with_capacity(bytes.len());
+-    let mut in_span_broken = Vec::new();
+-    let mut out_of_span_markers = Vec::new();
+-    let mut cursor = 0usize;
+-    for &(start, end) in &spans {
+-        decode_gap(
+-            &bytes[cursor..start],
+-            profile,
+-            cursor,
+-            &mut text,
+-            &mut out_of_span_markers,
+-        );
+-        let (run, broken) = decode_run(&bytes[start..end], profile, start);
+-        in_span_broken.extend(broken);
+-        text.push_str(&run);
+-        cursor = end;
+-    }
+-    decode_gap(
+-        &bytes[cursor..],
+-        profile,
+-        cursor,
+-        &mut text,
+-        &mut out_of_span_markers,
+-    );
+-    Ok(ScopedDecoded {
+-        text,
+-        in_span_broken,
+-        out_of_span_markers,
+-    })
+-}
+-
+-/// Decodes one quoted span: with markers it takes the profile's triple decode
+-/// (orphan markers come back as offsets); without markers it is readable
+-/// content — verbatim UTF-8 when valid, CP1252-mapped otherwise.
+-fn decode_run(segment: &[u8], profile: Profile, base: usize) -> (String, Vec<usize>) {
+-    if segment.iter().any(|byte| is_marker(*byte)) {
+-        // Localisation input was validated as UTF-8 above and script decode
+-        // never fails, so the triple decode cannot error here.
+-        let decoded = decode_file(segment, profile).expect("segment decode cannot fail");
+-        let broken = decoded
+-            .broken_sequences
+-            .iter()
+-            .map(|offset| offset + base)
+-            .collect();
+-        (decoded.text, broken)
+-    } else {
+-        match std::str::from_utf8(segment) {
+-            Ok(run) => (run.to_owned(), Vec::new()),
+-            Err(_) => (
+-                segment
+-                    .iter()
+-                    .map(|byte| char::from_u32(cp1252::byte_to_char(*byte)).unwrap_or('\u{FFFD}'))
+-                    .collect(),
+-                Vec::new(),
+-            ),
+-        }
+-    }
+-}
+-
+-/// Appends a between-spans run, recording marker bytes as damage evidence.
+-fn decode_gap(
+-    gap: &[u8],
+-    profile: Profile,
+-    base: usize,
+-    text: &mut String,
+-    out_of_span_markers: &mut Vec<usize>,
+-) {
+-    if gap.is_empty() {
+-        return;
+-    }
+-    for (offset, byte) in gap.iter().enumerate() {
+-        if is_marker(*byte) {
+-            out_of_span_markers.push(base + offset);
+-        }
+-    }
+-    let (run, _) = decode_run(gap, profile, base);
+-    text.push_str(&run);
+-}
+-
+-/// Scoped encoding refusal: either the buffer already carries escape triples
+-/// inside strings (pasted transcoded text — encoding again would double-
+-/// encode), or in-span content holds code points the transcoder refuses.
+-#[derive(Clone, Debug, PartialEq, Eq)]
+-pub enum ScopedEncodeError {
+-    /// Byte offsets (into the readable input) of markers found inside quoted
+-    /// spans.
+-    AlreadyEscaped { positions: Vec<usize> },
+-    /// Unencodable in-span code points, offsets rebased to the whole input.
+-    Unencodable { error: EncodeError },
+-}
+-
+-/// Encodes readable text into scoped-escaped bytes: escape triples only inside
+-/// quoted spans, verbatim UTF-8 outside them. In-span encoding follows the
+-/// profile's usual byte shape, so the game-side transcoder reads the strings
+-/// exactly as with whole-file encoding; comments and code stay readable.
+-///
+-/// # Errors
+-/// [`ScopedEncodeError::AlreadyEscaped`] for any in-span escape marker (iron
+-/// rule ②), [`ScopedEncodeError::Unencodable`] for refused in-span code points.
+-pub fn scoped_encode_file(
+-    input: &str,
+-    profile: Profile,
+-    escape_set: EscapeSet,
+-) -> Result<Vec<u8>, ScopedEncodeError> {
+-    let bytes = input.as_bytes();
+-    let spans = scan_string_spans(bytes);
+-    let mut positions = Vec::new();
+-    for &(start, end) in &spans {
+-        for (offset, byte) in bytes[start..end].iter().enumerate() {
+-            if is_marker(*byte) {
+-                positions.push(start + offset);
+-            }
+-        }
+-    }
+-    if !positions.is_empty() {
+-        return Err(ScopedEncodeError::AlreadyEscaped { positions });
+-    }
+-    let mut output = Vec::with_capacity(input.len() * 2);
+-    let mut cursor = 0usize;
+-    for &(start, end) in &spans {
+-        output.extend_from_slice(&bytes[cursor..start]);
+-        let span_text = &input[start..end];
+-        match encode_file(span_text, profile, escape_set) {
+-            Ok(mut encoded) => {
+-                output.append(&mut encoded);
+-            }
+-            Err(error) => {
+-                let error = EncodeError {
+-                    unencodable: error
+-                        .unencodable
+-                        .into_iter()
+-                        .map(|point| crate::UnencodableCodePoint {
+-                            byte_index: point.byte_index + start,
+-                            ..point
+-                        })
+-                        .collect(),
+-                };
+-                return Err(ScopedEncodeError::Unencodable { error });
+-            }
+-        }
+-        cursor = end;
+-    }
+-    output.extend_from_slice(&bytes[cursor..]);
+-    Ok(output)
+-}
+-
+-fn is_marker(byte: u8) -> bool {
+-    (0x10..=0x13).contains(&byte)
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use crate::escape::{decode_file, encode_file};
+-
+-    const P: EscapeSet = EscapeSet::Paratranz;
+-
+-    fn spans(text: &str) -> Vec<(usize, usize)> {
+-        scan_string_spans(text.as_bytes())
+-    }
+-
+-    #[test]
+-    fn scanner_finds_strings_and_skips_comments() {
+-        let text = "# top \"not a string\"\r\nkey = \"value\" # trailing\r\nl_english:\r\n";
+-        let start = text.find("\"value\"").expect("quoted value");
+-        assert_eq!(spans(text), vec![(start, start + "\"value\"".len())]);
+-        assert!(spans("# only comments \" \" here\n").is_empty());
+-        assert!(spans("plain code without quotes\r\n").is_empty());
+-    }
+-
+-    #[test]
+-    fn scanner_handles_escaped_quotes_and_open_strings() {
+-        let text = "a = \"say \\\"hi\\\" ok\"\nb = \"";
+-        let found = spans(text);
+-        assert_eq!(found.len(), 2);
+-        assert_eq!(&text[found[0].0..found[0].1], "\"say \\\"hi\\\" ok\"");
+-        // An unterminated string closes at end of input.
+-        assert_eq!(&text[found[1].0..found[1].1], "\"");
+-        // A string left open at end of line closes at the newline.
+-        let line = "a = \"multi\nb = \"ok\"\n";
+-        let found = spans(line);
+-        assert_eq!(found.len(), 2);
+-        assert_eq!(&line[found[0].0..found[0].1], "\"multi");
+-        assert_eq!(&line[found[1].0..found[1].1], "\"ok\"");
+-    }
+-
+-    #[test]
+-    fn scoped_script_round_trip_with_readable_comments() {
+-        let readable =
+-            "# 注释保持可读\r\ndynasty = \"大明王朝\"\r\n# 另一条注释\r\ntitle = \"帝国\"\r\n";
+-        let scoped = scoped_encode_file(readable, Profile::Script, P).expect("scoped encode");
+-        // Comments stay readable UTF-8 on disk; strings hold byte triples.
+-        assert!(scoped.starts_with("# 注释保持可读\r\n".as_bytes()));
+-        assert_eq!(scoped_form(&scoped, Profile::Script), ScopedForm::Scoped);
+-        let decoded = scoped_decode_file(&scoped, Profile::Script).expect("scoped decode");
+-        assert_eq!(decoded.text, readable);
+-        assert!(decoded.in_span_broken.is_empty());
+-        assert!(decoded.out_of_span_markers.is_empty());
+-    }
+-
+-    #[test]
+-    fn scoped_localisation_round_trip() {
+-        let readable = "l_english:\r\n demo_key:0 \"发行本\" # 注释\r\n";
+-        let scoped = scoped_encode_file(readable, Profile::Localisation, P).expect("scoped encode");
+-        assert!(scoped.starts_with("l_english:".as_bytes()));
+-        assert_eq!(
+-            scoped_form(&scoped, Profile::Localisation),
+-            ScopedForm::Scoped
+-        );
+-        let decoded = scoped_decode_file(&scoped, Profile::Localisation).expect("scoped decode");
+-        assert_eq!(decoded.text, readable);
+-    }
+-
+-    #[test]
+-    fn scoped_strings_match_whole_file_encoding() {
+-        // A file whose only non-ASCII content is inside strings must scope-
+-        // encode to exactly the whole-file form (comments are ASCII here).
+-        let readable = "dynasty = \"大明王朝\"\r\n";
+-        assert_eq!(
+-            scoped_encode_file(readable, Profile::Script, P).expect("scoped encode"),
+-            encode_file(readable, Profile::Script, P).expect("encode file")
+-        );
+-    }
+-
+-    #[test]
+-    fn partial_files_self_heal() {
+-        // One string escaped on disk, one readable, comment readable: scoped
+-        // decode shows all readable, scoped encode converges both strings.
+-        let escaped_part =
+-            encode_file("title = \"帝国\"\r\n", Profile::Script, P).expect("encode file");
+-        let mixed: Vec<u8> = [
+-            "# 注释\r\n".as_bytes(),
+-            &escaped_part,
+-            "dynasty = \"大明王朝\"\r\n".as_bytes(),
+-        ]
+-        .concat();
+-        assert_eq!(scoped_form(&mixed, Profile::Script), ScopedForm::Scoped);
+-        let decoded = scoped_decode_file(&mixed, Profile::Script).expect("scoped decode");
+-        assert_eq!(
+-            decoded.text,
+-            "# 注释\r\ntitle = \"帝国\"\r\ndynasty = \"大明王朝\"\r\n"
+-        );
+-        let healed = scoped_encode_file(&decoded.text, Profile::Script, P).expect("scoped encode");
+-        let redecoded = scoped_decode_file(&healed, Profile::Script).expect("scoped decode");
+-        assert_eq!(redecoded.text, decoded.text);
+-        // And the healed file re-encodes to itself (fixed point).
+-        assert_eq!(
+-            scoped_encode_file(&redecoded.text, Profile::Script, P).expect("scoped encode"),
+-            healed
+-        );
+-    }
+-
+-    #[test]
+-    fn whole_escaped_files_take_the_legacy_path() {
+-        let legacy =
+-            encode_file("# 注释\r\nkey = \"大明\"\r\n", Profile::Script, P).expect("encode file");
+-        assert_eq!(
+-            scoped_form(&legacy, Profile::Script),
+-            ScopedForm::WholeEscaped
+-        );
+-        // The legacy decoder still applies to it.
+-        assert_eq!(
+-            decode_file(&legacy, Profile::Script)
+-                .expect("decode file")
+-                .text,
+-            "# 注释\r\nkey = \"大明\"\r\n"
+-        );
+-    }
+-
+-    #[test]
+-    fn markers_outside_strings_are_damage() {
+-        // A stray marker in code position (outside quotes and comments).
+-        let damaged: Vec<u8> = [b'a', b' ', 0x10, 0x41, 0x42, b'\n'].to_vec();
+-        assert_eq!(scoped_form(&damaged, Profile::Script), ScopedForm::Damaged);
+-        assert_eq!(marker_outside_spans(&damaged), vec![2]);
+-        // The same triple inside a string is scoped content instead.
+-        let scoped: Vec<u8> = [b'a', b' ', b'"', 0x10, 0x41, 0x42, b'"', b'\n'].to_vec();
+-        assert_eq!(scoped_form(&scoped, Profile::Script), ScopedForm::Scoped);
+-        // A marker inside a comment is code-position damage too.
+-        let commented: Vec<u8> = [b'#', b' ', 0x10, b'\n'].to_vec();
+-        assert_eq!(
+-            scoped_form(&commented, Profile::Script),
+-            ScopedForm::Damaged
+-        );
+-    }
+-
+-    #[test]
+-    fn iron_rule_refuses_in_span_markers() {
+-        // A buffer carrying escaped triples inside its strings (as the editor
+-        // char layer would show pasted transcoded script content) is refused.
+-        let pasted = encode_file("key = \"大明\"\r\n", Profile::Script, P).expect("encode file");
+-        let buffer: String = "# 注释\r\n"
+-            .chars()
+-            .chain(
+-                pasted
+-                    .iter()
+-                    .map(|byte| char::from_u32(cp1252::byte_to_char(*byte)).unwrap_or('\u{FFFD}')),
+-            )
+-            .collect();
+-        match scoped_encode_file(&buffer, Profile::Script, P) {
+-            Err(ScopedEncodeError::AlreadyEscaped { positions }) => {
+-                assert!(!positions.is_empty());
+-            }
+-            other => panic!("expected AlreadyEscaped, got {other:?}"),
+-        }
+-    }
+-
+-    #[test]
+-    fn unencodable_positions_rebase_to_whole_input() {
+-        let readable = "# 注释\r\nkey = \"前😀后\"\r\n";
+-        match scoped_encode_file(readable, Profile::Script, P) {
+-            Err(ScopedEncodeError::Unencodable { error }) => {
+-                let expected = "# 注释\r\nkey = \"".len()
+-                    + "前".chars().next().expect("next element").len_utf8();
+-                assert_eq!(error.unencodable[0].byte_index, expected);
+-                assert_eq!(error.unencodable[0].code_point, 0x1F600);
+-            }
+-            other => panic!("expected Unencodable, got {other:?}"),
+-        }
+-    }
+-
+-    #[test]
+-    fn in_span_orphans_report_and_pass_through() {
+-        // Marker inside a string with fewer than two payload bytes left.
+-        let bytes: Vec<u8> = [b'"', 0x10, b'"', b'\n'].to_vec();
+-        let decoded = scoped_decode_file(&bytes, Profile::Script).expect("scoped decode");
+-        assert_eq!(decoded.in_span_broken, vec![1]);
+-        assert_eq!(decoded.text, "\"\u{0010}\"\n");
+-    }
+-
+-    #[test]
+-    fn localisation_invalid_utf8_refused() {
+-        assert!(scoped_decode_file(&[0xFF, 0xFE], Profile::Localisation).is_err());
+-    }
+-}
+diff --git a/crates/vfs/src/model.rs b/crates/vfs/src/model.rs
+index 6e0167d..c5f19e8 100644
+--- a/crates/vfs/src/model.rs
++++ b/crates/vfs/src/model.rs
+@@ -498,6 +498,10 @@ impl Default for WorkspaceScanLimits {
+ /// Classification of a recoverable source-root scan problem.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum WorkspaceScanIssueKind {
++    /// Examined file is outside the active game scan profile.
++    OutsideProfile,
++    /// Scan profile permits the file but no rule category classifies it.
++    Unclassified,
+     /// A directory entry was a symbolic link and was not followed.
+     SymlinkSkipped,
+     /// A subtree exceeded the configured nesting limit.
+@@ -534,6 +538,14 @@ pub struct WorkspaceScanIssue {
+ /// Summary of the most recent successful bounded workspace scan.
+ #[derive(Clone, Debug, Default, Eq, PartialEq)]
+ pub struct WorkspaceScanReport {
++    /// Live roots examined; installed persistent caches are not scanned.
++    pub scanned_roots: Vec<SourceRootId>,
++    /// Examined files excluded by the profile or rule classification.
++    pub excluded_files: usize,
++    /// Informational exclusions, independent of recoverable scan problems.
++    pub excluded_entries: Vec<WorkspaceScanIssue>,
++    /// Exclusions omitted after the bounded detail budget.
++    pub omitted_exclusions: usize,
+     /// Regular files examined before rules classification.
+     pub discovered_files: usize,
+     /// Classified, readable files added to the workspace after decoding.
+diff --git a/crates/vfs/src/scan.rs b/crates/vfs/src/scan.rs
+index 6cb996e..32982fc 100644
+--- a/crates/vfs/src/scan.rs
++++ b/crates/vfs/src/scan.rs
+@@ -15,6 +15,23 @@ use crate::model::{
+     WorkspaceScanToken,
+ };
+ 
++pub fn record_scan_exclusion(
++    report: &mut WorkspaceScanReport,
++    limits: WorkspaceScanLimits,
++    kind: WorkspaceScanIssueKind,
++    path: PathBuf,
++    detail: String,
++) {
++    report.excluded_files = report.excluded_files.saturating_add(1);
++    if report.excluded_entries.len() < limits.max_reported_issues {
++        report
++            .excluded_entries
++            .push(WorkspaceScanIssue { kind, path, detail });
++    } else {
++        report.omitted_exclusions = report.omitted_exclusions.saturating_add(1);
++    }
++}
++
+ pub fn record_scan_issue(
+     report: &mut WorkspaceScanReport,
+     limits: WorkspaceScanLimits,
+@@ -315,6 +332,13 @@ fn collect_disk_files(
+         }
+         scan.report.discovered_files = scan.report.discovered_files.saturating_add(1);
+         if !scan.profile.allows_scan_file(&relative) {
++            record_scan_exclusion(
++                scan.report,
++                scan.limits,
++                WorkspaceScanIssueKind::OutsideProfile,
++                path,
++                "file is outside the active game scan profile".to_owned(),
++            );
+             continue;
+         }
+         let logical = LogicalPath::parse(&relative)
+diff --git a/editors/vscode/README.md b/editors/vscode/README.md
+index e060377..e7fb76f 100644
+--- a/editors/vscode/README.md
++++ b/editors/vscode/README.md
+@@ -91,52 +91,35 @@ mission editor's context menu.
+ Mods running the EU4dll double-byte patch store localisation as escape-tripled bytes. ParadoxCode
+ ships a Rust-server-backed transcoder. By default, files keep their ordinary `file://` view:
+ 
+-- Use the editor-title **Decode Quoted Text (Readable Text)** button (down arrow) to write readable
+-  strings to disk, or **Encode Quoted Text (EU4dll Escape Form)** (up arrow) to write escaped strings.
+-  The buttons apply to `localisation/**/*.yml` and workspace script files matching
++- Use the editor-title **Decode Entire File (Readable Text)** button (down arrow) to write
++  readable text to disk, or **Encode Entire File (EU4dll Escape Form)** (up arrow) to write
++  escaped bytes. Comments, identifiers and strings are all converted. The buttons apply to
++  `localisation/**/*.yml` and workspace script files matching
+   `paradoxcode.localisation.transparentScriptGlobs` (`**/*.txt` by default).
+-- Both buttons operate only inside quoted strings. **Encode Quoted Text** converts readable fragments
+-  and preserves existing escape triples byte-for-byte; **Decode Quoted Text** decodes those triples
+-  and preserves readable fragments. This also applies when one string is partially transcoded.
+-  Comments and other unquoted bytes are never converted, including already-escaped comments
+-  in legacy files. Existing escape triples are never encoded again; decoded readable fragments
+-  are never decoded again.
+-- Save or close any unsaved editor for the file before converting. Each conversion writes a
+-  `.pre-transcode.bak` backup next to the original file before changing its bytes. The same
+-  commands are available in the Command Palette and Explorer context menu.
+-- Damaged escape sequences inside strings refuse the entire conversion and report a byte
+-  position. A conversion with no changes writes neither the file nor its backup. Changes made
+-  to the file or its editor while conversion is running require a retry.
+-
+-The automatic transparent pipeline and editable `pdcloc://` decoded views are **experimental**
+-and **disabled by default**. Search and navigation have known limitations.
+-To opt in, set `paradoxcode.localisation.transparentEncoding` to `true` and reload the VS Code
+-window. Changing the switch requires a window reload. When enabled:
+-
+-- Entry is path-scoped but content-gated: an eligible file — any `localisation/**/*.yml` or a
+-  script file matching `paradoxcode.localisation.transparentScriptGlobs` (`**/*.txt` by default)
+-  — takes over the raw tab and opens in the decoded view only when it actually participates in
+-  transcoding: an escaped or damaged form, or plain text whose quoted CJK a save would encode.
+-  Transcode fixed points (no escape markers, no quoted CJK) stay on their ordinary `file://` view
+-  so search, diff, git, and timeline keep working on them; a fixed point that later grows quoted
+-  CJK is promoted to the decoded view automatically. Files rendered inside a diff editor are
+-  never taken over. `paradoxcode.localisation.autoOpen` picks the policy: `needsTranscode` (this
+-  behaviour, the default), `always` (the legacy takeover of every eligible file whatever its
+-  bytes look like), or `off`. Plain readable files pass through unchanged; their quoted CJK is
+-  escape-encoded on the next save (announced by an informational `LocalisationWillTranscodeOnSave`
+-  hint).
+-- Saving writes the scoped form: escape triples only inside quoted strings, comments and code as
+-  readable UTF-8. Saving is refused when a
+-  string already contains escape markers, or holds code points the ecosystem cannot round-trip.
+-- Stray escape markers outside every quoted string are damage: the file is shown as-is with a
+-  `LocalisationMixedEncoding` error anchored at the marker; fix it by hand.
+-- While a decoded view is active, the status bar shows **EU4 decoded view (experimental)**; click it to open the
+-  raw transcoded file. Run **Peek at the Raw Transcoded Form** from the Command Palette to peek at
+-  the raw bytes momentarily; press Escape to return to the decoded view. **Open in Decoded
+-  (Chinese) View (Experimental)** remains available in the Command Palette and context menus.
+-- Turn `paradoxcode.localisation.transparentEncoding` off and reload the window to return to
+-  the default manual workflow. The decoded-view provider and automatic pipeline are disabled;
+-  the **Decode Quoted Text** and **Encode Quoted Text** buttons become available again.
++- Encoding preserves existing valid triples and converts every readable run. Decoding resolves
++  every triple and preserves readable UTF-8. Partially converted files converge without double
++  encoding. No quote-only mode or protocol option remains.
++- Save or close unsaved editors before converting. Each changed conversion writes the original
++  bytes to `.pre-transcode.bak`. No-op conversions write neither the file nor the backup. Edits
++  made while conversion is running require a retry.
++- Invalid localisation UTF-8, damaged triples anywhere in the file, and unencodable characters
++  anywhere in an encode input refuse the entire conversion and report input positions.
++- The connected server must advertise `pdcWholeFileTranscode`. Older servers are rejected before
++  conversion; update the server together with the extension.
++
++Automatic transparent encoding and editable `pdcloc://` views are **experimental** and
++**disabled by default**. Search and navigation have known limitations. Enable
++`paradoxcode.localisation.transparentEncoding` and reload the window to opt in:
++
++- `needsTranscode` opens eligible files when escaped/damaged content or text that saving would
++  convert occurs anywhere in the file. This includes comment-only CJK and bare identifiers.
++  `always` opens every eligible file; `off` requires an explicit command. Diff editors remain raw.
++- The decoded view uses the same whole-file codec as the manual buttons. Saving encodes the
++  entire file; valid existing triples are preserved. Damaged sequences and unencodable characters
++  prevent writes. Legacy files containing both readable text and escaped strings can be decoded
++  and saved into the complete file form.
++- The status bar and **Peek at the Raw Transcoded Form** command expose the original bytes.
++  Turn transparent encoding off and reload to return to the manual buttons.
+ 
+ ## Configuration
+ 
+diff --git a/editors/vscode/REFERENCE.md b/editors/vscode/REFERENCE.md
+index a01f442..e199ecb 100644
+--- a/editors/vscode/REFERENCE.md
++++ b/editors/vscode/REFERENCE.md
+@@ -251,7 +251,7 @@ Glob patterns for files excluded from workspace discovery.
+ 
+ ### `paradoxcode.localisation.autoOpen`
+ 
+-Automatic opening policy for the experimental `pdcloc://` decoded view; applies only when `paradoxcode.localisation.transparentEncoding` is enabled. `needsTranscode` (default): escaped or damaged files, or plain text whose quoted CJK a save would encode, enter the decoded view. `always`: every eligible file enters the decoded view. `off`: open the decoded view only by explicit command.
++Automatic opening policy for the experimental `pdcloc://` decoded view; applies only when `paradoxcode.localisation.transparentEncoding` is enabled. `needsTranscode` (default): escaped or damaged files, or plain text whose text anywhere in the file a save would encode, enter the decoded view. `always`: every eligible file enters the decoded view. `off`: open the decoded view only by explicit command.
+ 
+ ```json
+ {
+@@ -282,7 +282,7 @@ Localisation language preference. The first entry is the target language: hover
+ 
+ ### `paradoxcode.localisation.transparentEncoding`
+ 
+-Experimental EU4dll transparent encoding and `pdcloc://` decoded views. Disabled by default. When enabled, eligible files can open in the decoded view and saves encode quoted strings automatically (scoped form). Search and navigation have known limitations. When disabled, use the editor-title Decode File / Encode File buttons for manual disk conversion with a `.pre-transcode.bak` backup. Reload the VS Code window after changing this setting.
++Experimental EU4dll transparent encoding and `pdcloc://` decoded views. Disabled by default. When enabled, eligible files can open in the decoded view and saves encode the entire file automatically, including comments, identifiers and strings. Search and navigation have known limitations. When disabled, use the editor-title Decode File / Encode File buttons for manual disk conversion with a `.pre-transcode.bak` backup. Reload the VS Code window after changing this setting.
+ 
+ ```json
+ {
+@@ -544,6 +544,6 @@ Publish diagnostics for closed files in the project during workspace validation
+ | `paradoxcode.localisation.revealOriginal` | Open the Raw Transcoded File |
+ | `paradoxcode.localisation.peekOriginal` | Peek at the Raw Transcoded Form |
+ | `paradoxcode.localisation.endPeek` | Back to the Decoded View |
+-| `paradoxcode.localisation.encodeFile` | Encode Quoted Text (EU4dll Escape Form) |
+-| `paradoxcode.localisation.decodeFile` | Decode Quoted Text (Readable Text) |
++| `paradoxcode.localisation.encodeFile` | Encode Entire File (EU4dll Escape Form) |
++| `paradoxcode.localisation.decodeFile` | Decode Entire File (Readable Text) |
+ | `paradoxcode.openSearch` | Search |
+diff --git a/editors/vscode/l10n/README.md b/editors/vscode/l10n/README.md
+index a67f52f..117409d 100644
+--- a/editors/vscode/l10n/README.md
++++ b/editors/vscode/l10n/README.md
+@@ -45,7 +45,7 @@
+ | raw view / raw form | 原始视图 / 原始形态 | 磁盘上的转码形态 |
+ | peek | 窥视 | 窥视原始转码形态（临时切换） |
+ | escape marker / escape triplet | 逃逸标记 / 逃逸三元组 | EU4dll 编码单元 |
+-| scoped form | scoped 形态 | 只转码引号内内容的形态（技术名保留 scoped） |
++| whole-file form | 全文转码形态 | 注释、标识符和字符串均参与转码 |
+ | encode / decode | 编码 / 解码 | 手动转码命令动词 |
+ | follow-up completion | 后续补全 | 补全项插入后再次请求建议列表 |
+ | vanilla index cache | 原版索引缓存 | |
+diff --git a/editors/vscode/l10n/bundle.l10n.json b/editors/vscode/l10n/bundle.l10n.json
+index 3b1097e..db5533d 100644
+--- a/editors/vscode/l10n/bundle.l10n.json
++++ b/editors/vscode/l10n/bundle.l10n.json
+@@ -127,10 +127,10 @@
+   "Project": "Project",
+   "Pros: dependency changes are picked up automatically. Cons: large mods slow down startup and can cause lag.": "Pros: dependency changes are picked up automatically. Cons: large mods slow down startup and can cause lag.",
+   "Pros: fast startup even for large mods. Cons: changes made while the server runs are picked up only after Update Index Caches.": "Pros: fast startup even for large mods. Cons: changes made while the server runs are picked up only after Update Index Caches.",
+-  "Quoted CJK text stays readable here; saving encodes it into EU4dll escape triples inside the strings (comments and code stay readable on disk).": "Quoted CJK text stays readable here; saving encodes it into EU4dll escape triples inside the strings (comments and code stay readable on disk).",
++  "This text stays readable here; saving encodes the entire file, including comments and unquoted text.": "This text stays readable here; saving encodes the entire file, including comments and unquoted text.",
+   "read-only": "read-only",
+   "Refused to save: {0} code point(s) cannot be round-tripped by the EU4 transcoder ({1}). Replace or remove them first.": "Refused to save: {0} code point(s) cannot be round-tripped by the EU4 transcoder ({1}). Replace or remove them first.",
+-  "Refused to save: {0} escape marker(s) already sit inside quoted strings — encoding them again would double-encode. Undo the paste (or decode the text) first.": "Refused to save: {0} escape marker(s) already sit inside quoted strings — encoding them again would double-encode. Undo the paste (or decode the text) first.",
++  "Refused to save: a damaged escape sequence occurs at byte {0}. Fix it first.": "Refused to save: a damaged escape sequence occurs at byte {0}. Fix it first.",
+   "Refused to save: the editor buffer is not valid UTF-8.": "Refused to save: the editor buffer is not valid UTF-8.",
+   "Remove": "Remove",
+   "Remove a ParadoxCode dependency": "Remove a ParadoxCode dependency",
+@@ -148,7 +148,7 @@
+   "Slot {0}": "Slot {0}",
+   "Sprite scope": "Sprite scope",
+   "Sprite tiles": "Sprite tiles",
+-  "Stray EU4dll escape marker(s) outside every quoted string — the file is damaged and shown as-is. Move them inside a string or remove them.": "Stray EU4dll escape marker(s) outside every quoted string — the file is damaged and shown as-is. Move them inside a string or remove them.",
++  "A damaged EU4dll escape sequence occurs in this file. The original bytes are shown for repair.": "A damaged EU4dll escape sequence occurs in this file. The original bytes are shown for repair.",
+   "The automatic ParadoxCode server installation failed: {0}": "The automatic ParadoxCode server installation failed: {0}",
+   "The checksum sidecar contains an invalid SHA-256 digest.": "The checksum sidecar contains an invalid SHA-256 digest.",
+   "The checksum sidecar does not mention {0}.": "The checksum sidecar does not mention {0}.",
+@@ -182,18 +182,15 @@
+   "warning": "warning",
+   "Zoom in (+)": "Zoom in (+)",
+   "Zoom out (-)": "Zoom out (-)",
+-  "the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.": "the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.",
+-  "saving the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.": "saving the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.",
+-  "ParadoxCode: manual transcoding needs the ParadoxCode language server; it is starting or not running — retry shortly.": "ParadoxCode: manual transcoding needs the ParadoxCode language server; it is starting or not running — retry shortly.",
+-  "ParadoxCode: refused to {0} — a quoted string is not valid UTF-8.": "ParadoxCode: refused to {0} — a quoted string is not valid UTF-8.",
+-  "ParadoxCode: refused to {0} — a damaged escape sequence sits inside a quoted string at byte {1}. Fix it first.": "ParadoxCode: refused to {0} — a damaged escape sequence sits inside a quoted string at byte {1}. Fix it first.",
+-  "ParadoxCode: refused to {0} — {1} unencodable code point(s) inside strings ({2}).": "ParadoxCode: refused to {0} — {1} unencodable code point(s) inside strings ({2}).",
++  "ParadoxCode: refused to {0} — the file is not valid UTF-8.": "ParadoxCode: refused to {0} — the file is not valid UTF-8.",
++  "ParadoxCode: refused to {0} — a damaged escape sequence occurs at byte {1}. Fix it first.": "ParadoxCode: refused to {0} — a damaged escape sequence occurs at byte {1}. Fix it first.",
++  "ParadoxCode: refused to {0} — {1} unencodable code point(s) in the file ({2}).": "ParadoxCode: refused to {0} — {1} unencodable code point(s) in the file ({2}).",
+   "ParadoxCode: the file changed during conversion. Save or close it and retry.": "ParadoxCode: the file changed during conversion. Save or close it and retry.",
+   "ParadoxCode: could not {0} this file: {1}.": "ParadoxCode: could not {0} this file: {1}.",
+-  "ParadoxCode: quoted content needs no further encoding.": "ParadoxCode: quoted content needs no further encoding.",
+-  "ParadoxCode: quoted content contains no escape sequences to decode.": "ParadoxCode: quoted content contains no escape sequences to decode.",
+-  "ParadoxCode: encoded readable quoted content in {0}; existing escapes and comments were preserved (backup: {1}).": "ParadoxCode: encoded readable quoted content in {0}; existing escapes and comments were preserved (backup: {1}).",
+-  "ParadoxCode: decoded quoted content in {0}; comments were preserved (backup: {1}).": "ParadoxCode: decoded quoted content in {0}; comments were preserved (backup: {1}).",
++  "ParadoxCode: the file needs no further encoding.": "ParadoxCode: the file needs no further encoding.",
++  "ParadoxCode: the file contains no escape sequences to decode.": "ParadoxCode: the file contains no escape sequences to decode.",
++  "ParadoxCode: encoded the entire file {0}; existing escape sequences were preserved (backup: {1}).": "ParadoxCode: encoded the entire file {0}; existing escape sequences were preserved (backup: {1}).",
++  "ParadoxCode: decoded the entire file {0}, including comments and unquoted text (backup: {1}).": "ParadoxCode: decoded the entire file {0}, including comments and unquoted text (backup: {1}).",
+   "Retry": "Retry",
+   "Enter text to search…": "Enter text to search…",
+   "Opened the source line because this view represents the text differently.": "Opened the source line because this view represents the text differently.",
+@@ -270,5 +267,6 @@
+   "Match case": "Match case",
+   "No results match this query and its filters.": "No results match this query and its filters.",
+   "Context": "Context",
+-  "Indexing… Search will refresh when the workspace is ready.": "Indexing… Search will refresh when the workspace is ready."
++  "Indexing… Search will refresh when the workspace is ready.": "Indexing… Search will refresh when the workspace is ready.",
++  "Whole-file transcoding requires an updated ParadoxCode server. Update the server and retry.": "Whole-file transcoding requires an updated ParadoxCode server. Update the server and retry."
+ }
+diff --git a/editors/vscode/l10n/bundle.l10n.zh-cn.json b/editors/vscode/l10n/bundle.l10n.zh-cn.json
+index 4892bb3..8b68e84 100644
+--- a/editors/vscode/l10n/bundle.l10n.zh-cn.json
++++ b/editors/vscode/l10n/bundle.l10n.zh-cn.json
+@@ -94,10 +94,10 @@
+   "Project": "项目",
+   "Pros: dependency changes are picked up automatically. Cons: large mods slow down startup and can cause lag.": "优点：自动感知依赖变化。缺点：大型模组会拖慢启动，可能导致卡顿。",
+   "Pros: fast startup even for large mods. Cons: changes made while the server runs are picked up only after Update Index Caches.": "优点：启动快，大型模组也不例外。缺点：服务器运行期间的改动，需运行「更新索引缓存」后才会生效。",
+-  "Quoted CJK text stays readable here; saving encodes it into EU4dll escape triples inside the strings (comments and code stay readable on disk).": "引号内的中日韩文本在此保持可读；保存时会将其编码为字符串内的 EU4dll 逃逸三元组（注释和代码在磁盘上保持可读）。",
++  "This text stays readable here; saving encodes the entire file, including comments and unquoted text.": "文本在此保持可读；保存时会编码整个文件，包括注释和无引号文本。",
+   "Refused to save: the editor buffer is not valid UTF-8.": "拒绝保存：编辑器缓冲区不是有效的 UTF-8。",
+   "Refused to save: {0} code point(s) cannot be round-tripped by the EU4 transcoder ({1}). Replace or remove them first.": "拒绝保存：{0} 个码点无法经 EU4 转码器往返转换（{1}）。请先替换或移除。",
+-  "Refused to save: {0} escape marker(s) already sit inside quoted strings — encoding them again would double-encode. Undo the paste (or decode the text) first.": "拒绝保存：{0} 个逃逸标记已存在于引号字符串内——再次编码会造成双重编码。请先撤销粘贴（或解码文本）。",
++  "Refused to save: a damaged escape sequence occurs at byte {0}. Fix it first.": "拒绝保存：字节位置 {0} 存在受损的转义序列，请先修复。",
+   "Remove": "移除",
+   "Remove a ParadoxCode dependency": "移除一个 ParadoxCode 依赖",
+   "Remove dependency {0}?": "移除依赖 {0}？",
+@@ -112,7 +112,7 @@
+   "Slot {0}": "槽位 {0}",
+   "Sprite scope": "图像范围",
+   "Sprite tiles": "图像块",
+-  "Stray EU4dll escape marker(s) outside every quoted string — the file is damaged and shown as-is. Move them inside a string or remove them.": "EU4dll 逃逸标记游离于所有引号字符串之外——文件已受损，将按原样显示。请将它们移入字符串或删除。",
++  "A damaged EU4dll escape sequence occurs in this file. The original bytes are shown for repair.": "此文件含受损的 EU4dll 转义序列，显示原始字节以供修复。",
+   "The ParadoxCode language server is not running.": "ParadoxCode 语言服务器未运行。",
+   "The ParadoxCode server was not found. Install it from the release cache, select a binary, set paradoxcode.serverPath, or add paradoxcode to PATH.": "未找到 ParadoxCode 服务器。请从发布缓存安装、选择一个二进制文件、设置 paradoxcode.serverPath，或将 paradoxcode 加入 PATH。",
+   "The automatic ParadoxCode server installation failed: {0}": "自动安装 ParadoxCode 服务器失败：{0}",
+@@ -182,18 +182,15 @@
+   "paradoxcode.dependencies[{0}] has invalid id \"{1}\"": "paradoxcode.dependencies[{0}] 的 id 无效：\"{1}\"",
+   "paradoxcode.dependencies[{0}].index must be a string": "paradoxcode.dependencies[{0}].index 必须是字符串",
+   "The ParadoxCode extension manifest has an invalid version.": "ParadoxCode 扩展清单的版本号无效。",
+-  "the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.": "解码视图需要 ParadoxCode 语言服务器；服务器正在启动或未运行——请稍后重试。",
+-  "saving the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.": "保存解码视图需要 ParadoxCode 语言服务器；服务器正在启动或未运行——请稍后重试。",
+-  "ParadoxCode: manual transcoding needs the ParadoxCode language server; it is starting or not running — retry shortly.": "ParadoxCode：手动转码需要 ParadoxCode 语言服务器；服务器正在启动或未运行——请稍后重试。",
+-  "ParadoxCode: refused to {0} — a quoted string is not valid UTF-8.": "ParadoxCode：拒绝{0}——引号内字符串不是有效的 UTF-8。",
+-  "ParadoxCode: refused to {0} — a damaged escape sequence sits inside a quoted string at byte {1}. Fix it first.": "ParadoxCode：拒绝{0}——引号内字符串在字节位置 {1} 存在受损的转义序列，请先修复。",
+-  "ParadoxCode: refused to {0} — {1} unencodable code point(s) inside strings ({2}).": "ParadoxCode：拒绝{0}——引号内字符串有 {1} 个无法编码的码点（{2}）。",
++  "ParadoxCode: refused to {0} — the file is not valid UTF-8.": "ParadoxCode：拒绝{0}——文件不是有效的 UTF-8。",
++  "ParadoxCode: refused to {0} — a damaged escape sequence occurs at byte {1}. Fix it first.": "ParadoxCode：拒绝{0}——文件在字节位置 {1} 存在受损的转义序列，请先修复。",
++  "ParadoxCode: refused to {0} — {1} unencodable code point(s) in the file ({2}).": "ParadoxCode：拒绝{0}——文件有 {1} 个无法编码的码点（{2}）。",
+   "ParadoxCode: the file changed during conversion. Save or close it and retry.": "ParadoxCode：转换期间文件发生变化，请保存或关闭后重试。",
+   "ParadoxCode: could not {0} this file: {1}.": "ParadoxCode：无法{0}此文件：{1}。",
+-  "ParadoxCode: quoted content needs no further encoding.": "ParadoxCode：引号内内容无需进一步编码。",
+-  "ParadoxCode: quoted content contains no escape sequences to decode.": "ParadoxCode：引号内内容没有需要解码的转义序列。",
+-  "ParadoxCode: encoded readable quoted content in {0}; existing escapes and comments were preserved (backup: {1}).": "ParadoxCode：已编码 {0} 引号内的可读内容，已有转义序列和注释保持不变（备份：{1}）。",
+-  "ParadoxCode: decoded quoted content in {0}; comments were preserved (backup: {1}).": "ParadoxCode：已解码 {0} 引号内的转义序列，注释保持不变（备份：{1}）。",
++  "ParadoxCode: the file needs no further encoding.": "ParadoxCode：整个文件无需进一步编码。",
++  "ParadoxCode: the file contains no escape sequences to decode.": "ParadoxCode：文件没有需要解码的转义序列。",
++  "ParadoxCode: encoded the entire file {0}; existing escape sequences were preserved (backup: {1}).": "ParadoxCode：已编码整个文件 {0}，保留已有合法转义序列（备份：{1}）。",
++  "ParadoxCode: decoded the entire file {0}, including comments and unquoted text (backup: {1}).": "ParadoxCode：已解码整个文件 {0}，包括注释和无引号文本（备份：{1}）。",
+   "Retry": "重试",
+   "Enter text to search…": "输入要搜索的文字…",
+   "Opened the source line because this view represents the text differently.": "当前视图的文字表示不同，已定位到源文件行。",
+@@ -270,5 +267,6 @@
+   "Match case": "区分大小写",
+   "No results match this query and its filters.": "没有符合查询和筛选条件的结果。",
+   "Context": "上下文",
+-  "Indexing… Search will refresh when the workspace is ready.": "正在建立索引…工作区就绪后将刷新搜索。"
++  "Indexing… Search will refresh when the workspace is ready.": "正在建立索引…工作区就绪后将刷新搜索。",
++  "Whole-file transcoding requires an updated ParadoxCode server. Update the server and retry.": "全文转码需要更新后的 ParadoxCode 服务端，请更新服务端后重试。"
+ }
+diff --git a/editors/vscode/package.nls.json b/editors/vscode/package.nls.json
+index 2b35d3e..dfef126 100644
+--- a/editors/vscode/package.nls.json
++++ b/editors/vscode/package.nls.json
+@@ -82,10 +82,10 @@
+   "commands.localisation.revealOriginal.title": "Open the Raw Transcoded File",
+   "commands.localisation.peekOriginal.title": "Peek at the Raw Transcoded Form",
+   "commands.localisation.endPeek.title": "Back to the Decoded View",
+-  "configuration.localisation.transparentEncoding.description": "Experimental EU4dll transparent encoding and `pdcloc://` decoded views. Disabled by default. When enabled, eligible files can open in the decoded view and saves encode quoted strings automatically (scoped form). Search and navigation have known limitations. When disabled, use the editor-title Decode File / Encode File buttons for manual disk conversion with a `.pre-transcode.bak` backup. Reload the VS Code window after changing this setting.",
+-  "configuration.localisation.autoOpen.description": "Automatic opening policy for the experimental `pdcloc://` decoded view; applies only when `paradoxcode.localisation.transparentEncoding` is enabled. `needsTranscode` (default): escaped or damaged files, or plain text whose quoted CJK a save would encode, enter the decoded view. `always`: every eligible file enters the decoded view. `off`: open the decoded view only by explicit command.",
++  "configuration.localisation.transparentEncoding.description": "Experimental EU4dll transparent encoding and `pdcloc://` decoded views. Disabled by default. When enabled, eligible files can open in the decoded view and saves encode the entire file automatically, including comments, identifiers and strings. Search and navigation have known limitations. When disabled, use the editor-title Decode File / Encode File buttons for manual disk conversion with a `.pre-transcode.bak` backup. Reload the VS Code window after changing this setting.",
++  "configuration.localisation.autoOpen.description": "Automatic opening policy for the experimental `pdcloc://` decoded view; applies only when `paradoxcode.localisation.transparentEncoding` is enabled. `needsTranscode` (default): escaped or damaged files, or plain text whose text anywhere in the file a save would encode, enter the decoded view. `always`: every eligible file enters the decoded view. `off`: open the decoded view only by explicit command.",
+   "configuration.localisation.transparentScriptGlobs.description": "Workspace-relative script glob patterns for the manual Decode File / Encode File buttons and experimental decoded views (paratranz `latin1eu4` profile). Localisation YML files qualify independently. Default: `**/*.txt`; an empty list limits conversion to localisation YML.",
+-  "commands.localisation.encodeFile.title": "Encode Quoted Text (EU4dll Escape Form)",
+-  "commands.localisation.decodeFile.title": "Decode Quoted Text (Readable Text)",
++  "commands.localisation.encodeFile.title": "Encode Entire File (EU4dll Escape Form)",
++  "commands.localisation.decodeFile.title": "Decode Entire File (Readable Text)",
+   "command.openSearch.title": "Search"
+ }
+diff --git a/editors/vscode/package.nls.zh-cn.json b/editors/vscode/package.nls.zh-cn.json
+index 5135fd6..4342b7b 100644
+--- a/editors/vscode/package.nls.zh-cn.json
++++ b/editors/vscode/package.nls.zh-cn.json
+@@ -82,10 +82,10 @@
+   "commands.localisation.revealOriginal.title": "打开原始转码文件",
+   "commands.localisation.peekOriginal.title": "窥视原始转码形态",
+   "commands.localisation.endPeek.title": "返回解码视图",
+-  "configuration.localisation.transparentEncoding.description": "实验性的 EU4dll 自动透明转码和 `pdcloc://` 解码视图，默认关闭。开启后，符合条件的文件可进入解码视图，保存时自动编码引号内字符串（scoped 形态）。搜索和跳转仍有已知限制。关闭时，可使用编辑器标题栏的“解码文件 / 编码文件”按钮手动转换磁盘文件，并保留 `.pre-transcode.bak` 备份。修改此设置后请重新加载 VS Code 窗口。",
+-  "configuration.localisation.autoOpen.description": "实验性 `pdcloc://` 解码视图的自动打开策略；仅在启用 `paradoxcode.localisation.transparentEncoding` 后生效。`needsTranscode`（默认）：转码或受损文件，以及引号内含保存时需要编码的中文的可读文件，进入解码视图。`always`：所有符合条件的文件进入解码视图。`off`：仅通过明确的命令手动打开解码视图。",
++  "configuration.localisation.transparentEncoding.description": "实验性的 EU4dll 自动透明转码和 `pdcloc://` 解码视图，默认关闭。开启后，符合条件的文件可进入解码视图，保存时自动编码整个文件，包括注释、标识符和字符串。搜索和跳转仍有已知限制。关闭时，可使用编辑器标题栏的“解码文件 / 编码文件”按钮手动转换磁盘文件，并保留 `.pre-transcode.bak` 备份。修改此设置后请重新加载 VS Code 窗口。",
++  "configuration.localisation.autoOpen.description": "实验性 `pdcloc://` 解码视图的自动打开策略；仅在启用 `paradoxcode.localisation.transparentEncoding` 后生效。`needsTranscode`（默认）：转码或受损文件，以及任意位置含保存时需要编码的文本的可读文件，进入解码视图。`always`：所有符合条件的文件进入解码视图。`off`：仅通过明确的命令手动打开解码视图。",
+   "configuration.localisation.transparentScriptGlobs.description": "手动“解码文件 / 编码文件”按钮及实验性解码视图适用的脚本 glob（相对工作区，paratranz `latin1eu4` 档）。本地化 YML 不受此列表限制。默认：`**/*.txt`；空列表表示仅转换本地化 YML。",
+-  "commands.localisation.encodeFile.title": "编码引号内文本（EU4dll 转码形态）",
+-  "commands.localisation.decodeFile.title": "解码引号内文本（可读文本）",
++  "commands.localisation.encodeFile.title": "编码整个文件（EU4dll 转码形态）",
++  "commands.localisation.decodeFile.title": "解码整个文件（可读文本）",
+   "command.openSearch.title": "搜索"
+ }
+diff --git a/editors/vscode/src/transparentLoc.ts b/editors/vscode/src/transparentLoc.ts
+index e1b57c0..6d8169c 100644
+--- a/editors/vscode/src/transparentLoc.ts
++++ b/editors/vscode/src/transparentLoc.ts
+@@ -1,49 +1,9 @@
+ // Transparent localisation read/write for EU4dll-transcoded files.
+-//
+-// The `pdcloc://` scheme mirrors a `file://` URI over the same real path and
+-// is the one view the user edits: readFile shows readable CJK everywhere
+-// (legacy whole-escaped files decode wholesale; scoped files decode only
+-// their quoted strings, keeping comments readable), and writeFile
+-// scoped-encodes on save — escape triples land inside quoted strings only, so
+-// the game-side transcoder reads the strings exactly as with whole-file
+-// encoding while comments and code stay readable UTF-8 on disk. The language
+-// server receives the decoded text through normal document sync (it resolves
+-// `pdcloc://` URIs to the backing path, so the virtual document hides the
+-// on-disk shard and every position is a decoded-view position — no offset
+-// mapping).
+-//
+-// The codec itself lives in the language server: classification, decode, and
+-// encode travel over the `pdc/transcodeDecode` / `pdc/transcodeEncode`
+-// requests (byte payloads as hex), so this file owns only the provider
+-// plumbing, the client-side eligibility gates (path checks for menus, plus a
+-// charset prescreen for auto-open decisions — never a codec decision, the
+-// server always confirms), the save gate's error presentation, and file
+-// persistence. A missing server fails closed — eligible files are never
+-// written without the encode guard.
+-//
+-// Entry is path-scoped but content-gated: an eligible file (localisation yml
+-// or the configured script globs) opens through its pdcloc:// twin only when
+-// it actually participates in transcoding — an escaped or damaged form, or a
+-// plain form whose quoted CJK a save would encode. Transcode fixed points (no
+-// escape markers, no quoted CJK) stay on their `file://` URI untouched, so
+-// VS Code search, diff, git, and timeline keep working on them; a fixed point
+-// that later grows text a save would rewrite is promoted to its twin at that
+-// moment (debounced), closing the typed-CJK gap without hijacking files that
+-// have nothing to transcode. Plain readable files pass through unchanged (a
+-// save encodes their quoted CJK), damaged files pass through with an error,
+-// and only the server-side classifier decides which decode applies — never
+-// the caller.
+-//
+-// Iron rule ② (never encode twice / decode twice) is enforced by the
+-// server-side encoder — a save is refused outright when a string already
+-// contains escape markers, with the reason surfaced to the user.
+-//
+-// Opening an eligible file takes over its tab instead of adding a second
+-// one: the decoded view is shown in the raw tab's own slot (preview
+-// state included) and the raw tab is closed. `revealOriginal` pins the raw
+-// form the same way, and `peekOriginal` flips the slot momentarily — Esc or
+-// an editor-group switch flips it back (escape triples never contain newline
+-// bytes, so the cursor line survives every flip).
++// The pdcloc:// view decodes the entire backing file and saves the entire file
++// through the server codec. Comments, identifiers and strings share one codec;
++// valid existing triples are preserved on encoding and readable UTF-8 survives
++// decoding. File/profile eligibility and original-byte backups remain client
++// responsibilities. All conversion covers the complete file.
+ 
+ import * as fs from 'node:fs/promises';
+ import * as nodePath from 'node:path';
+@@ -134,38 +94,38 @@ const TRANSCODE_REQUEST_TIMEOUT_MS = 120_000;
+ /** Pause after the last edit before a watched buffer is judged for promotion. */
+ const TRANSCODE_PROMOTION_DEBOUNCE_MS = 700;
+ 
+-/** How a buffer relates to the scoped form, mirroring the server's classifier. */
+-type ScopedForm = 'plain' | 'whole' | 'scoped' | 'damaged';
++/** How a buffer relates to the whole-file form, mirroring the server's classifier. */
++type TranscodeForm = 'plain' | 'whole' | 'mixed' | 'damaged';
+ 
+ interface TranscodeDecodeResponse {
+     eligible?: boolean;
+     profile?: 'localisation' | 'script';
+-    form?: ScopedForm;
++    form?: TranscodeForm;
+     bytes?: string;
+     broken?: number;
+     damagedAt?: number;
+-    quotedCjk?: boolean;
++    needsEncoding?: boolean;
+     error?: 'invalid-utf8';
+ }
+ 
+ /** Server-controlled encode answer: either `bytes`, or `refused` with its payload. */
+ interface TranscodeEncodeResponse {
+     bytes?: string;
+-    refused?: 'alreadyEscaped' | 'unencodable' | 'invalidUtf8' | 'brokenEscape';
++    refused?: 'unencodable' | 'invalidUtf8' | 'brokenEscape';
+     offsets?: number[];
+     points?: { codePoint?: number; byteIndex?: number }[];
+ }
+ 
+ /** What a successful decode produced — the bytes to show plus read metadata. */
+ export interface DecodedView {
+-    form: ScopedForm;
++    form: TranscodeForm;
+     bytes: Uint8Array;
+-    /** Orphan markers the decoder passed through (whole-file or in-span). */
++    /** Damaged markers in the unchanged original bytes. */
+     broken: number;
+     /** First input byte offset of damage, for anchoring the damaged-form error. */
+     damagedAt: number | undefined;
+-    /** Plain form whose quoted CJK a save would encode. */
+-    quotedCjk: boolean;
++    /** Plain form whose text a save would encode. */
++    needsEncoding: boolean;
+ }
+ 
+ function hexToBytes(hex: string): Uint8Array {
+@@ -186,6 +146,11 @@ async function sendTranscodeRequest<T>(method: string, params: object): Promise<
+     } catch (error) {
+         throw new TranscodeUnavailableError(error instanceof Error ? error.message : String(error));
+     }
++    if (client.initializeResult?.capabilities.experimental?.pdcWholeFileTranscode !== true) {
++        throw new TranscodeUnavailableError(vscode.l10n.t(
++            'Whole-file transcoding requires an updated ParadoxCode server. Update the server and retry.',
++        ));
++    }
+     try {
+         return await withTimeout(
+             client.sendRequest<T>(method, params),
+@@ -228,13 +193,13 @@ async function transcodeDecode(
+         bytes: hexToBytes(response.bytes),
+         broken: typeof response.broken === 'number' ? response.broken : 0,
+         damagedAt: typeof response.damagedAt === 'number' ? response.damagedAt : undefined,
+-        quotedCjk: response.quotedCjk === true,
++        needsEncoding: response.needsEncoding === true,
+     };
+ }
+ 
+ type EncodeOutcome =
+     | { bytes: Uint8Array }
+-    | { alreadyEscaped: number[] }
++    | { brokenEscape: number[] }
+     | { unencodable: { codePoint: number }[] }
+     | 'invalid-utf8';
+ 
+@@ -252,8 +217,8 @@ async function transcodeEncode(real: vscode.Uri, bytes: Uint8Array): Promise<Enc
+     if (typeof response.bytes === 'string') {
+         return { bytes: hexToBytes(response.bytes) };
+     }
+-    if (response.refused === 'alreadyEscaped') {
+-        return { alreadyEscaped: Array.isArray(response.offsets) ? response.offsets : [] };
++    if (response.refused === 'brokenEscape') {
++        return { brokenEscape: Array.isArray(response.offsets) ? response.offsets : [] };
+     }
+     if (response.refused === 'invalidUtf8') {
+         return 'invalid-utf8';
+@@ -276,59 +241,46 @@ async function transcodeEncode(real: vscode.Uri, bytes: Uint8Array): Promise<Enc
+ // ---------------------------------------------------------------------------
+ 
+ /**
+- * Conservative client-side prescreen mirroring the only signal characters the
+- * server classifier reads: escape markers (U+0010..=U+0013) and raw CJK-range
+- * code points. A buffer with neither is a transcode fixed point — the server
+- * can only answer `plain` without quoted CJK for it — so the (large) majority
+- * of ASCII files never costs a server round-trip. This never makes a codec
+- * decision: anything carrying a signal is still classified server-side.
++ * Conservative client-side prescreen: escape markers or any non-ASCII content
++ * can require whole-file conversion or refusal. The server makes the final
++ * profile-aware decision. Plain ASCII/BOM files remain ordinary documents.
+  */
+ function hasTranscodeSignal(text: string): boolean {
+     for (const character of text) {
+         const codePoint = character.codePointAt(0) ?? 0;
+-        if ((codePoint >= 0x10 && codePoint <= 0x13) || isRawCjkCodePoint(codePoint)) {
++        if ((codePoint >= 0x10 && codePoint <= 0x13) || (codePoint > 0x7f && codePoint !== 0xfeff)) {
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+-/** Mirror of the server's `transcode::is_raw_cjk` — keep the ranges in sync. */
+-function isRawCjkCodePoint(codePoint: number): boolean {
+-    return (
+-        (codePoint >= 0x2e80 && codePoint <= 0x9fff) // CJK radicals, kana, unified ideographs, Yi
+-        || (codePoint >= 0xac00 && codePoint <= 0xd7af) // Hangul syllables
+-        || (codePoint >= 0xf900 && codePoint <= 0xfaff) // CJK compatibility ideographs
+-        || (codePoint >= 0xff00 && codePoint <= 0xffef) // fullwidth forms
+-        || (codePoint >= 0x20000 && codePoint <= 0x2fa1f) // supplementary planes B-F + compat supplement
+-        || (codePoint >= 0x30000 && codePoint <= 0x3134f) // plane G+
+-    );
+-}
++
+ 
+ /**
+  * Whether the transparent view would do work for this classification: the
+  * decoded form differs from the raw bytes, or a save through the twin would
+  * rewrite them. Only such files may take over a `file://` tab; transcode
+- * fixed points (`plain` without quoted CJK) stay on their real URI so VS Code
++ * fixed points (`plain` without text) stay on their real URI so VS Code
+  * search, diff, git, and timeline keep working on them.
+  */
+ function needsDecodedView(view: DecodedView): boolean {
+     return (
+         view.form === 'whole'
+-        || view.form === 'scoped'
++        || view.form === 'mixed'
+         || view.form === 'damaged'
+-        || (view.form === 'plain' && view.quotedCjk)
++        || (view.form === 'plain' && view.needsEncoding)
+     );
+ }
+ 
+ /**
+  * Whether `buffer` is exactly the state the auto-promotion may act on: a
+- * plain form whose quoted CJK a save would encode. Unlike `needsDecodedView`
++ * plain form whose text a save would encode. Unlike `needsDecodedView`
+  * this is safe for a mid-edit buffer — the raw save a promotion performs is
+  * byte-preserving here, so nothing is rewritten behind the user's back.
+  */
+ function needsSaveTimeEncoding(view: DecodedView): boolean {
+-    return view.form === 'plain' && view.quotedCjk;
++    return view.form === 'plain' && view.needsEncoding;
+ }
+ 
+ /** How aggressively eligible files are moved onto their decoded twin. */
+@@ -445,7 +397,7 @@ class PdclocFileSystemProvider implements vscode.FileSystemProvider {
+         } catch (error) {
+             this.logTranscodeFailure('read', real, error);
+             throw vscode.FileSystemError.Unavailable(
+-                vscode.l10n.t('the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.'),
++                vscode.l10n.t('ParadoxCode: {0}', error instanceof Error ? error.message : String(error)),
+             );
+         }
+         if (view === 'invalid-utf8') {
+@@ -478,7 +430,7 @@ class PdclocFileSystemProvider implements vscode.FileSystemProvider {
+         } catch (error) {
+             this.logTranscodeFailure('save', real, error);
+             throw vscode.FileSystemError.Unavailable(
+-                vscode.l10n.t('saving the decoded view needs the ParadoxCode language server; it is starting or not running — retry shortly.'),
++                vscode.l10n.t('ParadoxCode: {0}', error instanceof Error ? error.message : String(error)),
+             );
+         }
+         if (encoded === 'invalid-utf8') {
+@@ -489,15 +441,12 @@ class PdclocFileSystemProvider implements vscode.FileSystemProvider {
+             void vscode.window.showErrorMessage(vscode.l10n.t('ParadoxCode: {0}', message));
+             throw vscode.FileSystemError.NoPermissions(message);
+         }
+-        if ('alreadyEscaped' in encoded) {
++        if ('brokenEscape' in encoded) {
+             const message = vscode.l10n.t(
+-                'Refused to save: {0} escape marker(s) already sit inside quoted strings — '
+-                + 'encoding them again would double-encode. Undo the paste (or decode the text) first.',
+-                encoded.alreadyEscaped.length,
+-            );
+-            this.log.appendLine(
+-                `transparentLoc: refused save of ${real.fsPath} (in-span escape markers)`,
++                'Refused to save: a damaged escape sequence occurs at byte {0}. Fix it first.',
++                encoded.brokenEscape[0] ?? 0,
+             );
++            this.log.appendLine(`transparentLoc: refused save of ${real.fsPath} (${message})`);
+             void vscode.window.showErrorMessage(vscode.l10n.t('ParadoxCode: {0}', message));
+             throw vscode.FileSystemError.NoPermissions(message);
+         }
+@@ -585,18 +534,16 @@ class PdclocFileSystemProvider implements vscode.FileSystemProvider {
+             diagnostic = new vscode.Diagnostic(
+                 new vscode.Range(line, 0, line, 0),
+                 vscode.l10n.t(
+-                    'Stray EU4dll escape marker(s) outside every quoted string — the file is damaged '
+-                    + 'and shown as-is. Move them inside a string or remove them.',
++                    'A damaged EU4dll escape sequence occurs in this file. The original bytes are shown for repair.',
+                 ),
+                 vscode.DiagnosticSeverity.Error,
+             );
+             diagnostic.code = 'LocalisationMixedEncoding';
+-        } else if (view.form === 'plain' && view.quotedCjk) {
++        } else if (view.form === 'plain' && view.needsEncoding) {
+             diagnostic = new vscode.Diagnostic(
+                 new vscode.Range(0, 0, 0, 0),
+                 vscode.l10n.t(
+-                    'Quoted CJK text stays readable here; saving encodes it into EU4dll escape '
+-                    + 'triples inside the strings (comments and code stay readable on disk).',
++                    'This text stays readable here; saving encodes the entire file, including comments and unquoted text.',
+                 ),
+                 vscode.DiagnosticSeverity.Information,
+             );
+@@ -760,7 +707,7 @@ async function openDecodedView(uri: vscode.Uri | undefined): Promise<void> {
+     }
+     // Eligibility is the only gate for this explicit command: readFile
+     // dispatches on the actual form — plain files pass through byte-identical,
+-    // escaped and scoped files decode, damaged files show as-is with an error.
++    // escaped and mixed files decode, damaged files show as-is with an error.
+     // Carry the cursor over: a search jump lands on the raw file first (with
+     // its match selection), and the flip to the twin must not strand the user
+     // at the top of the file instead of their target.
+@@ -959,9 +906,7 @@ async function convertFileManually(
+         const original = await fs.readFile(real.fsPath);
+         const response = await sendTranscodeRequest<TranscodeEncodeResponse & { eligible?: boolean }>(
+             direction === 'encode' ? 'pdc/transcodeEncode' : 'pdc/transcodeDecode',
+-            direction === 'encode'
+-                ? { path: real.fsPath, bytes: bytesToHex(original), preserveEscaped: true }
+-                : { path: real.fsPath, bytes: bytesToHex(original), quotedOnly: true },
++            { path: real.fsPath, bytes: bytesToHex(original) },
+         );
+         if (response?.eligible === false) {
+             void vscode.window.showErrorMessage(vscode.l10n.t(
+@@ -972,13 +917,13 @@ async function convertFileManually(
+         }
+         if (response?.refused === 'invalidUtf8') {
+             void vscode.window.showErrorMessage(vscode.l10n.t(
+-                'ParadoxCode: refused to {0} — a quoted string is not valid UTF-8.', verb,
++                'ParadoxCode: refused to {0} — the file is not valid UTF-8.', verb,
+             ));
+             return;
+         }
+         if (response?.refused === 'brokenEscape') {
+             void vscode.window.showErrorMessage(vscode.l10n.t(
+-                'ParadoxCode: refused to {0} — a damaged escape sequence sits inside a quoted string at byte {1}. Fix it first.',
++                'ParadoxCode: refused to {0} — a damaged escape sequence occurs at byte {1}. Fix it first.',
+                 verb, response.offsets?.[0] ?? 0,
+             ));
+             return;
+@@ -987,7 +932,7 @@ async function convertFileManually(
+             const points = response.points ?? [];
+             const examples = points.map((point) => formatCodePoint(point.codePoint ?? 0)).slice(0, 8).join(', ');
+             void vscode.window.showErrorMessage(vscode.l10n.t(
+-                'ParadoxCode: refused to {0} — {1} unencodable code point(s) inside strings ({2}).',
++                'ParadoxCode: refused to {0} — {1} unencodable code point(s) in the file ({2}).',
+                 verb, points.length, examples,
+             ));
+             return;
+@@ -998,8 +943,8 @@ async function convertFileManually(
+         const converted = hexToBytes(response.bytes);
+         if (original.equals(converted)) {
+             void vscode.window.showInformationMessage(direction === 'encode'
+-                ? vscode.l10n.t('ParadoxCode: quoted content needs no further encoding.')
+-                : vscode.l10n.t('ParadoxCode: quoted content contains no escape sequences to decode.'));
++                ? vscode.l10n.t('ParadoxCode: the file needs no further encoding.')
++                : vscode.l10n.t('ParadoxCode: the file contains no escape sequences to decode.'));
+             return;
+         }
+         if (hasDirtyDocument(real) || !original.equals(await fs.readFile(real.fsPath))) {
+@@ -1011,11 +956,11 @@ async function convertFileManually(
+         const backup = `${real.fsPath}.pre-transcode.bak`;
+         await fs.writeFile(backup, original);
+         await fs.writeFile(real.fsPath, converted);
+-        log.appendLine(`transparentLoc: ${direction}d quoted content in ${real.fsPath} (backup: ${backup})`);
++        log.appendLine(`transparentLoc: ${direction}d the entire file ${real.fsPath} (backup: ${backup})`);
+         void vscode.window.showInformationMessage(direction === 'encode'
+-            ? vscode.l10n.t('ParadoxCode: encoded readable quoted content in {0}; existing escapes and comments were preserved (backup: {1}).',
++            ? vscode.l10n.t('ParadoxCode: encoded the entire file {0}; existing escape sequences were preserved (backup: {1}).',
+                 nodePath.basename(real.fsPath), nodePath.basename(backup))
+-            : vscode.l10n.t('ParadoxCode: decoded quoted content in {0}; comments were preserved (backup: {1}).',
++            : vscode.l10n.t('ParadoxCode: decoded the entire file {0}, including comments and unquoted text (backup: {1}).',
+                 nodePath.basename(real.fsPath), nodePath.basename(backup)));
+     } catch (error) {
+         if (error instanceof TranscodeUnavailableError) {
+@@ -1040,7 +985,7 @@ function reportManualTranscodeFailure(
+     log.appendLine(`transparentLoc: manual ${verb} of ${real.fsPath} failed: ${message}`);
+     void vscode.window.showErrorMessage(
+         vscode.l10n.t(
+-            'ParadoxCode: manual transcoding needs the ParadoxCode language server; it is starting or not running — retry shortly.',
++            'ParadoxCode: {0}', message,
+         ),
+     );
+ }
+@@ -1080,7 +1025,7 @@ async function adoptDecodedView(
+     const text = document.getText();
+     if (!hasTranscodeSignal(text)) {
+         // Fixed point by construction: no markers and no CJK anywhere means
+-        // the classifier can only answer `plain` without quoted CJK.
++        // the classifier can only answer `plain` without text.
+         watchedPassThrough.add(key);
+         return;
+     }
+@@ -1116,8 +1061,8 @@ async function adoptDecodedView(
+ }
+ 
+ /**
+- * Promotes a watched pass-through document the moment its buffer grows quoted
+- * CJK a save would encode — without this the typed-CJK gap would reopen and
++ * Promotes a watched pass-through document when any part of its buffer grows
++ * text a save would encode — without this the typed-CJK gap would reopen and
+  * the next raw save would bypass the encode guard. The buffer is saved first
+  * (the promoted shape is byte-preserving on a raw save), then the tab flips to
+  * the twin keeping the cursor position: at swap time the twin content is
+@@ -1186,7 +1131,7 @@ async function promoteWatchedDocument(
+  * Opens the decoded view when an eligible file is opened through its raw
+  * path, taking over the raw tab instead of adding a second one. The path
+  * decides scope; the content gate decides whether the twin adds anything —
+- * transcode fixed points pass through untouched, whole-escaped and scoped
++ * transcode fixed points pass through untouched, whole-escaped and mixed
+  * files decode, and damaged files show as-is with an error (the form dispatch
+  * lives in readFile, never here). This also adopts files the moment they land
+  * on an eligible path (Save As from an untitled buffer, a file moved into
+@@ -1247,7 +1192,7 @@ async function maybeAutoOpenDecodedView(
+  * the master switch: on, the `pdcloc://` FileSystemProvider, decoded-view
+  * commands, automatic content-gated redirection (see
+  * `paradoxcode.localisation.autoOpen`), the status-bar indicator, and
+- * save-time scoped encoding are all active; off, only the manual one-shot
++ * save-time whole-file encoding are all active; off, only the manual one-shot
+  * encode/decode commands remain (their menus hide through the same config
+  * check). When the artifact is missing the feature degrades to a log line,
+  * never an error.
+diff --git a/editors/vscode/test/transparent-loc.mjs b/editors/vscode/test/transparent-loc.mjs
+index 637eb8e..6308dec 100644
+--- a/editors/vscode/test/transparent-loc.mjs
++++ b/editors/vscode/test/transparent-loc.mjs
+@@ -27,7 +27,7 @@ function host(root, settings = {}) {
+     };
+     const state = {
+         contexts: new Map(), commands: new Map(), providers: [], requests: [], messages: [], opens: [],
+-        settings, active: undefined,
++        settings, active: undefined, wholeFileTranscode: true,
+         emit(name, value) { for (const callback of callbacks[name] ?? []) callback(value); },
+         show(document) { this.active = document ? { document } : undefined; this.emit('active', this.active); },
+     };
+@@ -36,6 +36,10 @@ function host(root, settings = {}) {
+         Disposable: class { constructor(dispose) { this.dispose = dispose; } static from() { return { dispose() {} }; } },
+         EventEmitter: class { event = () => ({ dispose() {} }); fire() {} dispose() {} },
+         StatusBarAlignment: { Left: 1 },
++        Diagnostic: class { constructor(range, message, severity) { Object.assign(this, { range, message, severity }); } },
++        Range: class { constructor(...args) { this.args = args; } },
++        DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2 },
++        FileSystemError: { NoPermissions: message => new Error(message), Unavailable: message => new Error(message) },
+         l10n: { t: (message, ...args) => message.replace(/\{(\d+)\}/g, (_, i) => args[i]) },
+         commands: {
+             registerCommand(name, callback) { state.commands.set(name, callback); return { dispose() {} }; },
+@@ -77,6 +81,7 @@ function host(root, settings = {}) {
+             if (id === 'vscode') return vscode;
+             if (id === './serverClient') return {
+                 acquireServerClient: async () => ({
++                    initializeResult: { capabilities: { experimental: { pdcWholeFileTranscode: state.wholeFileTranscode } } },
+                     async sendRequest(method, params) {
+                         state.requests.push({ method, params });
+                         return state.respond(method, params);
+@@ -184,7 +189,7 @@ try {
+     await test('manual decode and encode update ordinary files and preserve the input backup', async () => {
+         const state = host(root);
+         const document = state.document('localisation/manual.yml');
+-        const readable = Buffer.from('l_english:\n KEY:0 "中文"\n');
++        const readable = Buffer.from('l_english:\n # 中文注释\n 中文键:0 "中文"\n');
+         const escaped = Buffer.from('l_english:\n KEY:0 "\x10-N\x10‡e"\n');
+         mkdirSync(dirname(document.uri.fsPath), { recursive: true });
+         writeFileSync(document.uri.fsPath, escaped);
+@@ -195,13 +200,63 @@ try {
+         assert.deepEqual(readFileSync(document.uri.fsPath), readable);
+         assert.deepEqual(readFileSync(`${document.uri.fsPath}.pre-transcode.bak`), escaped);
+         state.respond = (method) => method === 'pdc/transcodeDecode'
+-            ? { eligible: true, form: 'plain', bytes: readable.toString('hex'), quotedCjk: true }
++            ? { eligible: true, form: 'plain', bytes: readable.toString('hex'), needsEncoding: true }
+             : { bytes: escaped.toString('hex') };
+         await state.commands.get('paradoxcode.localisation.encodeFile')(document.uri);
+         assert.deepEqual(readFileSync(document.uri.fsPath), escaped);
+         assert.deepEqual(readFileSync(`${document.uri.fsPath}.pre-transcode.bak`), readable);
+         assert.equal(state.opens.length, 0);
+         assert.equal(document.uri.scheme, 'file');
++        for (const { params } of state.requests) assert.deepEqual(Object.keys(params).sort(), ['bytes', 'path']);
++    });
++
++    await test('manual conversion rejects an old server before requesting or writing bytes', async () => {
++        const state = host(root);
++        state.wholeFileTranscode = false;
++        const document = state.document('events/old-server.txt');
++        mkdirSync(dirname(document.uri.fsPath), { recursive: true });
++        writeFileSync(document.uri.fsPath, '# 中文注释\n中文 = "x"\n');
++        const original = readFileSync(document.uri.fsPath);
++        state.show(document);
++        await state.activate();
++        await state.commands.get('paradoxcode.localisation.encodeFile')(document.uri);
++        assert.equal(state.requests.length, 0);
++        assert.deepEqual(readFileSync(document.uri.fsPath), original);
++        assert.match(state.messages.at(-1), /updated ParadoxCode server/i);
++        assert.throws(() => readFileSync(`${document.uri.fsPath}.pre-transcode.bak`), /ENOENT/);
++    });
++
++    await test('damaged comment refuses manual conversion and preserves file and backup', async () => {
++        const state = host(root);
++        const document = state.document('events/damaged-comment.txt');
++        mkdirSync(dirname(document.uri.fsPath), { recursive: true });
++        const original = Buffer.from('# \x10\nname = "x"\n');
++        writeFileSync(document.uri.fsPath, original);
++        state.show(document);
++        await state.activate();
++        state.respond = () => ({ refused: 'brokenEscape', offsets: [2], bytes: original.toString('hex') });
++        await state.commands.get('paradoxcode.localisation.decodeFile')(document.uri);
++        assert.deepEqual(readFileSync(document.uri.fsPath), original);
++        assert.match(state.messages.at(-1), /byte 2/i);
++        assert.throws(() => readFileSync(`${document.uri.fsPath}.pre-transcode.bak`), /ENOENT/);
++    });
++
++    await test('transparent saves use the same whole-file request and preserve refusal behavior', async () => {
++        const state = host(root, { transparentEncoding: true, autoOpen: 'off' });
++        await state.activate();
++        const real = state.document('events/transparent.txt').uri;
++        mkdirSync(dirname(real.fsPath), { recursive: true });
++        const readable = Buffer.from('# 中文注释\n中文 = "中文"\n');
++        const encoded = Buffer.from('# \x10-N\nkey = "\x10-N"\n');
++        writeFileSync(real.fsPath, readable);
++        state.respond = () => ({ bytes: encoded.toString('hex') });
++        await state.providers[0].provider.writeFile(real.with({ scheme: 'pdcloc' }), readable);
++        assert.deepEqual(readFileSync(real.fsPath), encoded);
++        assert.equal(state.requests.at(-1).method, 'pdc/transcodeEncode');
++        assert.deepEqual(Object.keys(state.requests.at(-1).params).sort(), ['bytes', 'path']);
++        state.respond = () => ({ refused: 'unencodable', points: [{ codePoint: 0x1f600 }] });
++        await assert.rejects(() => state.providers[0].provider.writeFile(real.with({ scheme: 'pdcloc' }), Buffer.from('# 😀\n')), /cannot be round-tripped/);
++        assert.deepEqual(readFileSync(real.fsPath), encoded);
+     });
+ 
+     await test('manual conversion refuses unsaved edits before requesting a codec or writing', async () => {
+diff --git a/rules/eu4/events.json b/rules/eu4/events.json
+index eb24e97..8c589a3 100644
+--- a/rules/eu4/events.json
++++ b/rules/eu4/events.json
+@@ -312,9 +312,8 @@
+         },
+         "hidden": {
+           "card": "0..1",
+-          "doc": "If yes, the event runs in the background without popping up for the player.",
+-          "severity": "warning",
+-          "value": "'yes'"
++          "doc": "If yes, the event runs in the background without popping up for the player; option blocks are optional.",
++          "value": "bool"
+         },
+         "id": {
+           "card": "1",
+@@ -366,7 +365,7 @@
+         "option": {
+           "body": "event_body__option",
+           "card": "1..*",
+-          "doc": "A selectable choice; points to its localisation text and holds effects, availability triggers, ai_chance, highlight and goto.",
++          "doc": "A selectable choice; points to its localisation text and holds effects, availability triggers, ai_chance, highlight and goto. Required for visible events; optional when hidden = yes.",
+           "override": true
+         },
+         "picture": [

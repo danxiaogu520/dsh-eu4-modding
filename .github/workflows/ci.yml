@@ -42,7 +42,7 @@ jobs:
           git -C "$RUNNER_TEMP/paradoxcode" fetch --depth 1 https://github.com/danxiaogu520/ParadoxCode.git eae304594f5c987fa9723d12f46854e2861449ca
           git -C "$RUNNER_TEMP/paradoxcode" checkout --detach FETCH_HEAD
       - name: Apply server fixes
-        run: git -C "$RUNNER_TEMP/paradoxcode" apply "$GITHUB_WORKSPACE/patches/paradoxcode-0.5.3.patch"
+        run: git -C "$RUNNER_TEMP/paradoxcode" apply "$GITHUB_WORKSPACE/patches/paradoxcode-fixes.patch"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

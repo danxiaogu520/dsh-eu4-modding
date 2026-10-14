@@ -173,7 +173,7 @@ cargo build --locked --release -p pdc --bin paradoxcode
 
 ## 能力边界
 
-- **ParadoxCode 0.5.2 兼容性。** 既有 `pdc/*` 查询继续可用，插件直接连接 stdio LSP，不受 MCP 拆分影响。新增编辑器搜索面板接口不改变现有查询工具。转码工具支持 `quotedOnly: true` 解码和 `preserveEscaped: true` 编码，保留注释及已有转义；这两项行为需要 0.5.2+。`latest` 会跟随未来稳定版，固定版本适合需要复现结果的工作区。
+- **ParadoxCode 0.5.2 兼容性。** 既有 `pdc/*` 查询继续可用，插件直接连接 stdio LSP，不受 MCP 拆分影响。转码统一处理完整文件，包括注释、标识符和字符串，已删除仅处理引号内容的参数。转码服务端须声明 `pdcWholeFileTranscode` 能力；旧版服务端会收到明确的升级提示。合法的已有转义序列会保留，损坏序列或无法编码的字符拒绝整次转换。`latest` 会跟随未来稳定版，固定版本适合需要复现结果的工作区。
 - **草稿联合分析。** 插件先打开整个草稿批次，再在共同覆盖层上执行 `pdc/textDiagnostics`。本批其它文件的新定义参与引用解析。成功、错误或取消后都会关闭所有临时文档，并等待原工作区恢复；恢复失败则回收该服务器。关联文件落盘后仍需磁盘诊断。
 - **分析预览不落盘。** 不写 Mod 脚本、不应用 WorkspaceEdit，也拒绝服务器要求客户端执行编辑的请求。依赖管理工具的显式保存操作仅写共享 `.vscode/settings.json`；Mod 源文件修改继续由 DSH 的既有工具完成。
 - **保持原始分析信息。** 分页、匹配歧义、扫描问题、LSP 错误码与冲突信息均保留。原生显示超限会输出有效 JSON 摘要，优先保留计数、续页信息和逐文件摘要；完整 JSON 可由 PTC 或 `paradoxcode_result` 读取。摘要自身超预算时会明确报告省略的文件摘要数量。后端自身的结果数量与本地化预览上限仍适用。
@@ -209,11 +209,11 @@ npm pack
 
 ## 服务端修复与发布
 
-`patches/paradoxcode-0.5.3.patch` 包含 ParadoxCode 0.5.2 开发源码（基准提交 `eae304594f5c987fa9723d12f46854e2861449ca`）上的隐藏事件 option 条件要求、原查询接口分页、根身份和扫描明细修复，以及回归测试。插件兼容官方 0.5.2；这些服务端增强需要应用补丁后的服务器或包含同样能力的正式新版本。补丁未发布时，不会伪称官方 0.5.2 已经具有这些能力。
+`patches/paradoxcode-fixes.patch` 包含 ParadoxCode 0.5.2 开发源码（基准提交 `eae304594f5c987fa9723d12f46854e2861449ca`）上的隐藏事件 option 条件要求、原查询接口分页、根身份和扫描明细修复，以及全文转码实现和回归测试。插件兼容官方 0.5.2；这些服务端增强需要应用补丁后的服务器或包含同样能力的正式新版本。补丁未发布时，不会伪称官方 0.5.2 已经具有这些能力。
 
 ```bash
 git -C /path/to/ParadoxCode checkout --detach eae304594f5c987fa9723d12f46854e2861449ca
-git -C /path/to/ParadoxCode apply /path/to/dsh-eu4-modding/patches/paradoxcode-0.5.3.patch
+git -C /path/to/ParadoxCode apply /path/to/dsh-eu4-modding/patches/paradoxcode-fixes.patch
 cargo build --locked --release --manifest-path /path/to/ParadoxCode/Cargo.toml -p pdc --bin paradoxcode
 ```
 

@@ -155,3 +155,21 @@ test('all drafts are open together and their overlays are restored before return
   const closed = after.value.result.notifications.filter(note => note.method === 'textDocument/didClose');
   assert.equal(closed.length, 2);
 });
+
+test('transcoding has one whole-file protocol and rejects quote-only options and old servers', async t => {
+  const h = await fixture(t);
+  const input = '# 中文注释\n中文 = "中文"\n';
+  const result = await h.call('paradoxcode_transcode_preview', { action: 'encode', path: 'events/chinese.txt', text: input });
+  assert.equal(result.isError, false, JSON.stringify(result));
+  assert.equal(result.value.result.params.bytes, Buffer.from(input).toString('hex'));
+  assert.deepEqual(Object.keys(result.value.result.params).sort(), ['bytes', 'path']);
+  for (const options of [{ quotedOnly: true }, { preserveEscaped: true }]) {
+    const rejected = await h.call('paradoxcode_transcode_preview', { action: 'encode', path: 'events/chinese.txt', text: input, ...options });
+    assert.equal(rejected.isError, true);
+  }
+  const oldWorkspace = join(h.root, 'legacy-transcode-old');
+  await mkdir(oldWorkspace);
+  const rejected = await h.call('paradoxcode_transcode_preview', { workspace: oldWorkspace, action: 'encode', path: 'events/chinese.txt', text: input });
+  assert.equal(rejected.isError, true);
+  assert.match(JSON.stringify(rejected), /updated ParadoxCode server/);
+});
