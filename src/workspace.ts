@@ -1,5 +1,6 @@
 import { watch, type FSWatcher } from 'node:fs';
 import { readFile, realpath, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { Config } from './config.js';
@@ -21,6 +22,36 @@ export function logicalPath(value: string): string {
 export function within(root: string, path: string): boolean {
   const rel = relative(root, path);
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+/** Which indexed root owns a path, and whether that root is the writable Mod. */
+export interface PathLocation { root: string; id: string; writable: boolean; logicalPath: string }
+
+/** A source file read from disk, decoded to UTF-8 when the on-disk encoding is not UTF-8. */
+export interface DecodedFile {
+  bytes: Buffer;
+  text: string;
+  encoding: string;
+  /** True when the bytes could not be decoded faithfully; text then contains replacement characters. */
+  lossy: boolean;
+  sha256: string;
+  damage: JsonObject | null;
+}
+
+/** Human-readable summary of the backend transcode metadata, or null when the decode was clean. */
+export function damageSummary(damage: JsonObject | null | undefined): string | null {
+  if (!damage) return null;
+  const parts: string[] = [];
+  if (typeof damage.form === 'string') parts.push(`form=${damage.form}`);
+  if (typeof damage.profile === 'string') parts.push(`profile=${damage.profile}`);
+  // 0.5.3 reports a machine-readable cause; 0.5.2 only reported a byte offset.
+  if (typeof damage.error === 'string') parts.push(`error=${damage.error}`);
+  if (typeof damage.refused === 'string') parts.push(`refused=${damage.refused}`);
+  else if (damage.refused === true) parts.push('refused=true');
+  if (typeof damage.damagedAt === 'number') parts.push(`damagedAt=${damage.damagedAt}`);
+  if (typeof damage.broken === 'number' && damage.broken > 0) parts.push(`broken=${damage.broken}`);
+  if (damage.eligible === false) parts.push('eligible=false');
+  return parts.length ? parts.join(' ') : null;
 }
 
 /** Sessions are serialized so temporary document overlays never leak to another agent. */
@@ -105,6 +136,54 @@ export class WorkspaceSession {
     return this.connection.request(method, params, signal);
   }
 
+  /** Server-advertised experimental capabilities, for example `pdcQueryPagination`. */
+  supports(feature: string): boolean {
+    const experimental = this.connection.capabilities.experimental;
+    return !!experimental && typeof experimental === 'object' && !Array.isArray(experimental) && experimental[feature] === true;
+  }
+
+  /** Locate a resolved absolute path in the indexed Mod, dependency and Vanilla roots. */
+  locate(path: string): PathLocation {
+    const root = this.roots.find(candidate => within(candidate, path)) ?? (within(this.root, path) ? this.root : undefined);
+    if (!root) throw new Error('File is outside the indexed Mod, dependency and Vanilla roots');
+    const dependency = this.shared?.dependencies.find(row => within(row.path, path));
+    return {
+      root,
+      id: dependency?.id ?? (within(this.root, path) ? 'mod' : 'vanilla'),
+      writable: within(this.root, path),
+      logicalPath: relative(root, path).replaceAll('\\', '/'),
+    };
+  }
+
+  /**
+   * Read a source file and decode it: UTF-8 bytes are returned as-is, anything else goes through the
+   * server's transcode profile for that path. Lossy results are flagged instead of throwing so that
+   * read-style callers can show a best-effort view with an explicit warning.
+   */
+  async decodeFile(path: string, signal?: AbortSignal, maxBytes = 16 * 1024 * 1024): Promise<DecodedFile> {
+    checkAbort(signal);
+    const info = await stat(path);
+    if (!info.isFile()) throw new Error('Source must be a regular file');
+    if (info.size > maxBytes) throw new Error(`Source exceeds the ${Math.round(maxBytes / (1024 * 1024))} MiB read limit`);
+    const bytes = await readFile(path);
+    if (bytes.subarray(0, 8192).includes(0)) throw new Error('Source contains NUL bytes and is not a text file; use file tools for binary assets');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    checkAbort(signal);
+    try { return { bytes, text: new TextDecoder('utf8', { fatal: true, ignoreBOM: true }).decode(bytes), encoding: 'utf-8', lossy: false, sha256, damage: null }; }
+    catch (error) { if (!(error instanceof TypeError)) throw error; }
+    if (!this.supports('pdcWholeFileTranscode')) throw new Error('Decoding this non-UTF-8 source requires ParadoxCode 0.5.3 or newer (pdcWholeFileTranscode). Upgrade the server with serverVersion: latest.');
+    const result = object(await this.request('pdc/transcodeDecode', { path, bytes: bytes.toString('hex') }, signal));
+    const damage: JsonObject = {};
+    for (const key of ['eligible', 'refused', 'broken', 'damagedAt', 'form', 'profile', 'error']) if (result[key] !== undefined) damage[key] = result[key]!;
+    const decoded = typeof result.bytes === 'string' ? Buffer.from(result.bytes, 'hex') : null;
+    const form = typeof result.form === 'string' ? result.form : 'unknown';
+    if (decoded) {
+      try { return { bytes, text: new TextDecoder('utf8', { fatal: true, ignoreBOM: true }).decode(decoded), encoding: `transcode:${form}`, lossy: false, sha256, damage }; }
+      catch { /* the decoded bytes are not UTF-8 either: fall through to a lossy view */ }
+    }
+    return { bytes, text: new TextDecoder('utf8').decode(decoded ?? bytes), encoding: `transcode:${form} (lossy)`, lossy: true, sha256, damage };
+  }
+
   async withDrafts<T>(files: { path: string; text: string }[], signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
     const documents: { uri: string; path: string; text: string }[] = [];
     // Validate every boundary before opening any overlay.
@@ -143,7 +222,7 @@ export class WorkspaceSession {
     }
   }
 
-  async withDocument<T>(path: string, draft: string | undefined, signal: AbortSignal | undefined, fn: (uri: string, text: string) => Promise<T>): Promise<T> {
+  async withDocument<T>(path: string, draft: string | undefined, signal: AbortSignal | undefined, fn: (uri: string, text: string, decoded?: { encoding: string; lossy: boolean }) => Promise<T>): Promise<T> {
     checkAbort(signal);
     let resolved = path.startsWith('file:') ? fileURLToPath(path) : resolve(this.root, path);
     if (draft !== undefined) {
@@ -167,13 +246,16 @@ export class WorkspaceSession {
       if (!info.isFile() || info.size > 4 * 1024 * 1024) throw new Error('Document must be a file of at most 4 MiB');
     }
     let text: string;
+    let decoded: { encoding: string; lossy: boolean } | undefined;
     if (draft !== undefined) text = draft;
     else {
-      try { text = new TextDecoder('utf8', { fatal: true, ignoreBOM: true }).decode(await readFile(resolved)); }
-      catch (error) {
-        if (!(error instanceof TypeError)) throw error;
-        throw new Error('Document bytes are not UTF-8. Use paradoxcode_transcode_preview to inspect encoded text; disk diagnostics analyze the original source encoding.');
-      }
+      // Legacy-encoded sources are decoded through the server's transcode profile so that cursor
+      // features keep working on dependency Mods instead of refusing the whole document.
+      const file = await this.decodeFile(resolved, signal, 4 * 1024 * 1024);
+      const damage = damageSummary(file.damage);
+      if (file.lossy) throw new Error(`Document bytes are not decodable text${damage ? ` (${damage})` : ''}. Use paradoxcode_read for a best-effort view with explicit damage metadata, or paradoxcode_transcode_preview to inspect the raw encoding; disk diagnostics analyze the original bytes.`);
+      text = file.text;
+      decoded = { encoding: file.encoding, lossy: false };
     }
     if (Buffer.byteLength(text, 'utf8') > 4 * 1024 * 1024) throw new Error('Document text exceeds 4 MiB');
     checkAbort(signal);
@@ -181,7 +263,7 @@ export class WorkspaceSession {
     this.connection.notify('textDocument/didOpen', { textDocument: {
       uri, languageId: /\.ya?ml$/i.test(resolved) ? 'localisation' : 'eu4', version: ++this.version, text,
     } });
-    try { return await fn(uri, text); } finally {
+    try { return await fn(uri, text, decoded); } finally {
       if (this.connection.alive) this.connection.notify('textDocument/didClose', { textDocument: { uri } });
     }
   }

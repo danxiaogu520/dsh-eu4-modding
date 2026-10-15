@@ -1,18 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { chmod, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { normalizeConfig } from '../lib/config.js';
 import { WorkspacePool } from '../lib/workspace.js';
+import { removeTempDir, tempDir } from './helpers.mjs';
 
 const server = resolve('test/fixtures/server.mjs');
 await chmod(server, 0o755);
 
 async function fixture(t, config = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-pool-test-'));
+  const root = await tempDir('dsh-pool-test-');
   const pool = new WorkspacePool(normalizeConfig({ serverPath: server, vanillaMode: 'disabled', autoRefresh: false, ...config }));
-  t.after(async () => { await pool.dispose(); await rm(root, { recursive: true, force: true }); });
+  t.after(async () => { await pool.dispose(); await removeTempDir(root); });
   return { root, pool };
 }
 
@@ -53,18 +53,31 @@ test('concurrent callers cannot observe another caller’s temporary document ov
 
 test('draft document symlinks cannot escape the Mod root', async t => {
   const { root, pool } = await fixture(t);
-  const outside = await mkdtemp(join(tmpdir(), 'dsh-outside-draft-'));
-  t.after(() => rm(outside, { recursive: true, force: true }));
-  await symlink(outside, join(root, 'events'), 'dir');
+  const outside = await tempDir('dsh-outside-draft-');
+  t.after(() => removeTempDir(outside));
+  // Directory junctions need no elevation on Windows, unlike symbolic links.
+  await symlink(outside, join(root, 'events'), process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(pool.run(root, undefined, async session => session.withDocument('events/draft.txt', 'x', undefined, async () => null)), /outside the Mod/);
 });
 
-test('non-UTF-8 disk documents are refused instead of creating a lossy overlay', async t => {
+test('non-UTF-8 disk documents are decoded through the transcode profile before analysis', async t => {
   const { root, pool } = await fixture(t);
   await mkdir(join(root, 'events'));
   await writeFile(join(root, 'events/encoded.txt'), Buffer.from([0xff, 0xfe, 0x01]));
-  await assert.rejects(pool.run(root, undefined, async session => session.withDocument('events/encoded.txt', undefined, undefined, async () => null)), /not UTF-8/);
+  const decoded = await pool.run(root, undefined, async session => session.withDocument('events/encoded.txt', undefined, undefined, async (_uri, text, meta) => ({ text, meta })));
+  assert.equal(decoded.text, '解码后的中文 key = value\n');
+  assert.deepEqual(decoded.meta, { encoding: 'transcode:plain', lossy: false });
 });
+
+test('undecodable documents are refused instead of creating a lossy overlay', async t => {
+  const parent = await tempDir('dsh-pool-test-');
+  const root = join(parent, 'pdc-damaged');
+  await mkdir(join(root, 'events'), { recursive: true });
+  t.after(() => removeTempDir(parent));
+  const pool = new WorkspacePool(normalizeConfig({ serverPath: server, vanillaMode: 'disabled', autoRefresh: false }));
+  t.after(() => pool.dispose());
+  await writeFile(join(root, 'events/encoded.txt'), Buffer.from([0xff, 0xfe, 0x01]));
+  await assert.rejects(pool.run(root, undefined, async session => session.withDocument('events/encoded.txt', undefined, undefined, async () => null)), /not decodable text \(form=damaged/);});
 
 test('dirty file paths refresh their owning workspace and preserve unrelated sessions', async t => {
   const { root, pool } = await fixture(t, { autoRefresh: true, maxWorkspaces: 3 });

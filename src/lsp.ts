@@ -6,6 +6,12 @@ import { abortError, checkAbort, object, type Json, type JsonObject } from './js
 const MAX_FRAME = 64 * 1024 * 1024;
 const MAX_HEADER = 8192;
 
+/**
+ * JavaScript entry points are launched through this runtime. On Windows a .mjs/.cjs file is not
+ * executable at all, so spawning it directly fails with EFTYPE; native executables are unaffected.
+ */
+function isScript(file: string): boolean { return /\.(?:c|m)?js$/i.test(file); }
+
 export class LspError extends Error {
   constructor(public readonly code: number, message: string, public readonly data?: Json) {
     super(`ParadoxCode LSP (${code}): ${message}`);
@@ -48,7 +54,9 @@ export class LspConnection {
     });
     // The child may fail before initialization begins.
     void this.ready.catch(() => {});
-    this.child = spawn(serverPath, [], { cwd: workspace, stdio: 'pipe', windowsHide: true, shell: false });
+    const script = isScript(serverPath);
+    const command = script ? process.execPath : serverPath;
+    this.child = spawn(command, script ? [serverPath] : [], { cwd: workspace, stdio: 'pipe', windowsHide: true, shell: false });
     this.closed = new Promise(resolve => {
       this.child.once('close', (code, signal) => {
         this.exited = true;
@@ -57,7 +65,7 @@ export class LspConnection {
       });
     });
     this.child.on('error', error => {
-      this.fail(new Error(`Cannot launch ParadoxCode at ${serverPath}: ${error.message}. Configure serverPath with a standalone paradoxcode executable.`));
+      this.fail(new Error(`Cannot launch ParadoxCode at ${serverPath}: ${error.message}. Configure serverPath with a standalone paradoxcode executable${script ? ' or make sure this Node runtime can execute the script' : ''}.`));
     });
     this.child.stdin.on('error', error => this.fail(error));
     this.child.stdout.on('error', error => this.fail(error));
@@ -77,7 +85,7 @@ export class LspConnection {
     try {
       const response = object(await this.request('initialize', {
         processId: process.pid,
-        clientInfo: { name: 'dsh-eu4-modding', version: '0.1.1' },
+        clientInfo: { name: 'dsh-eu4-modding', version: '0.1.2' },
         workspaceFolders: [{ uri: pathToFileURL(this.workspace).href, name: basename(this.workspace) }],
         capabilities: {
           window: { workDoneProgress: true },

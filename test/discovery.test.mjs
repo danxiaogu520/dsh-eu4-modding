@@ -1,15 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { discoverModRoot } from '../lib/discovery.js';
-import { harness } from './helpers.mjs';
+import { harness, removeTempDir, tempDir } from './helpers.mjs';
 
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-discovery-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir('dsh-discovery-test-');
+  t.after(() => removeTempDir(root));
   return root;
 }
 

@@ -1,14 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { crc32, deflateRawSync, gzipSync } from 'node:zlib';
 import { extractServer, platformArtifact } from '../lib/archive.js';
 import { normalizeConfig } from '../lib/config.js';
 import { parseChecksum, resolveServer } from '../lib/server.js';
-import { harness } from './helpers.mjs';
+import { harness, removeTempDir, tempDir } from './helpers.mjs';
 
 const linux = platformArtifact('linux', 'x64');
 const windows = platformArtifact('win32', 'x64');
@@ -57,14 +56,18 @@ function zip(bytes, name = 'paradoxcode.exe', mode = 0o100755) {
   return Buffer.concat([local, filename, compressed, central, filename, end]);
 }
 
+/** Package a fixture payload the way the current platform's release asset is packaged. */
+function pack(bytes, artifact = platformArtifact()) {
+  return artifact.extension === 'zip' ? zip(bytes) : tar(bytes);
+}
+
 async function fixture(t, options = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-download-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await tempDir('dsh-download-test-');
+  t.after(() => removeTempDir(root));
   return normalizeConfig({ serverCacheDirectory: root, ...options });
 }
 
-function github(archive, version = '0.5.2', options = {}) {
-  const artifact = options.artifact ?? linux;
+function github(archive, version = '0.5.2', options = {}) {  const artifact = options.artifact ?? linux;
   const name = `paradoxcode-v${version}-${artifact.target}.${artifact.extension}`;
   const digest = options.checksum ?? sha(archive);
   const calls = [];
@@ -109,43 +112,54 @@ test('tar and Windows ZIP extraction reject unsafe entries, symlinks, corruption
 test('latest release is checksum verified, cached, upgraded on a new resolver and usable offline', async t => {
   const config = await fixture(t);
   const bytes = Buffer.from('versioned executable');
-  const first = github(tar(bytes));
+  const first = github(tar(bytes), '0.5.3');
   const installed = await resolveServer(config, undefined, first);
-  assert.equal(installed.version, '0.5.2');
+  assert.equal(installed.version, '0.5.3');
   assert.deepEqual(await readFile(installed.path), bytes);
   assert.equal(first.calls.length, 3);
-  const again = github(tar(bytes));
+  const again = github(tar(bytes), '0.5.3');
   assert.equal((await resolveServer(config, undefined, again)).path, installed.path);
   assert.equal(again.calls.length, 1);
-  const next = github(tar(bytes), '0.5.3');
+  const next = github(tar(bytes), '0.5.4');
   const upgraded = await resolveServer(config, undefined, next);
-  assert.equal(upgraded.version, '0.5.3');
+  assert.equal(upgraded.version, '0.5.4');
   assert.notEqual(upgraded.path, installed.path);
-  const offline = { ...first, fetch: async () => { throw new Error('offline'); } };
+  const offline = { ...next, fetch: async () => { throw new Error('offline'); } };
   const cached = await resolveServer(config, undefined, offline);
-  assert.equal(cached.version, '0.5.3');
+  assert.equal(cached.version, '0.5.4');
   assert.match(cached.warning, /verified cached/);
   await writeFile(upgraded.path, 'corrupted executable');
   const older = await resolveServer(config, undefined, offline);
-  assert.equal(older.version, '0.5.2');
+  assert.equal(older.version, '0.5.3');
   assert.deepEqual(await readFile(older.path), bytes);
 });
 
+test('servers older than 0.5.3 are refused instead of silently degrading', async t => {
+  const config = await fixture(t, { serverVersion: 'latest' });
+  const legacy = github(tar(Buffer.from('legacy server')), '0.5.2');
+  await assert.rejects(resolveServer(config, undefined, legacy), /0\.5\.2/);
+  // A verified 0.5.2 cache must not satisfy a latest resolution either.
+  const pinned = normalizeConfig({ ...config, serverVersion: '0.5.2' });
+  await assert.rejects(resolveServer(pinned, undefined, legacy));
+  const bootstrap = await resolveServer(config, undefined, { ...github(tar(Buffer.from('bootstrap')), '0.5.3'), fetch: async url => { throw new Error(`offline ${url}`); } }).catch(error => error);
+  assert.ok(bootstrap instanceof Error, 'offline resolution still fails without a cache');
+});
+
 test('fixed versions use the verified cache without GitHub and explicit executables bypass downloads', async t => {
-  const config = await fixture(t, { serverVersion: '0.5.2' });
-  const mock = github(tar(Buffer.from('pinned')));
+  const config = await fixture(t, { serverVersion: '0.5.3' });
+  const mock = github(tar(Buffer.from('pinned')), '0.5.3');
   const first = await resolveServer(config, undefined, mock);
   assert.equal(mock.calls.length, 2);
   assert.deepEqual(await resolveServer(config, undefined, { ...mock, fetch: async () => { throw new Error('must not fetch'); } }), first);
   assert.deepEqual(await resolveServer(normalizeConfig({ serverPath: 'paradoxcode' }), undefined, { fetch: async () => { throw new Error('must not fetch'); } }), { source: 'local', path: 'paradoxcode' });
-  const win = github(zip(Buffer.from('windows')), '0.5.2', { artifact: windows, platform: 'win32' });
+  const win = github(zip(Buffer.from('windows')), '0.5.3', { artifact: windows, platform: 'win32' });
   const result = await resolveServer(config, undefined, win);
   assert.ok(result.path.endsWith('paradoxcode.exe'));
 });
 
 test('latest can use a verified fixed-version cache without a latest pointer', async t => {
-  const config = await fixture(t, { serverVersion: '0.5.2' });
-  const mock = github(tar(Buffer.from('fixed cache')));
+  const config = await fixture(t, { serverVersion: '0.5.3' });
+  const mock = github(tar(Buffer.from('fixed cache')), '0.5.3');
   const pinned = await resolveServer(config, undefined, mock);
   const latest = await resolveServer({ ...config, serverVersion: 'latest' }, undefined, { ...mock, fetch: async () => new Response(null, { status: 403 }) });
   assert.equal(latest.path, pinned.path);
@@ -156,15 +170,15 @@ test('API rate limits permit cold downloads through release redirects and bootst
   for (const useRedirect of [true, false]) {
     const config = await fixture(t);
     const archive = tar(Buffer.from('cold verified server'));
-    const mock = github(archive);
+    const mock = github(archive, '0.5.3');
     const fetch = async (url, init) => {
       const parsed = new URL(url);
       if (parsed.hostname === 'api.github.com') return new Response(null, { status: 403 });
-      if (parsed.pathname.endsWith('/latest')) return new Response(null, useRedirect ? { status: 302, headers: { location: '/danxiaogu520/ParadoxCode/releases/tag/v0.5.2' } } : { status: 403 });
+      if (parsed.pathname.endsWith('/latest')) return new Response(null, useRedirect ? { status: 302, headers: { location: '/danxiaogu520/ParadoxCode/releases/tag/v0.5.3' } } : { status: 403 });
       return mock.fetch(url, init);
     };
     const server = await resolveServer(config, undefined, { ...mock, fetch });
-    assert.equal(server.version, '0.5.2');
+    assert.equal(server.version, '0.5.3');
     assert.deepEqual(await readFile(server.path), Buffer.from('cold verified server'));
     assert.match(server.warning, useRedirect ? /web redirect/ : /bootstrap version/);
   }
@@ -173,7 +187,7 @@ test('API rate limits permit cold downloads through release redirects and bootst
 test('GitHub authentication stays on the API host across resource redirects', async t => {
   const config = await fixture(t);
   const archive = tar(Buffer.from('auth boundary'));
-  const mock = github(archive);
+  const mock = github(archive, '0.5.3');
   const previous = process.env.GH_TOKEN;
   process.env.GH_TOKEN = 'test-token';
   t.after(() => { if (previous === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = previous; });
@@ -186,26 +200,26 @@ test('GitHub authentication stays on the API host across resource redirects', as
 });
 
 test('concurrent downloads share a complete cache and corrupt receipts are repaired', async t => {
-  const config = await fixture(t, { serverVersion: '0.5.2' });
-  const mock = github(tar(Buffer.from('concurrent')));
+  const config = await fixture(t, { serverVersion: '0.5.3' });
+  const mock = github(tar(Buffer.from('concurrent')), '0.5.3');
   const results = await Promise.all([resolveServer(config, undefined, mock), resolveServer(config, undefined, mock)]);
   assert.equal(results[0].path, results[1].path);
-  const directory = join(config.serverCacheDirectory, `0.5.2-${linux.target}`);
+  const directory = join(config.serverCacheDirectory, `0.5.3-${linux.target}`);
   assert.deepEqual((await readdir(directory)).sort(), ['paradoxcode', 'receipt.json']);
   await writeFile(join(directory, 'receipt.json'), 'null');
   await resolveServer(config, undefined, mock);
-  assert.equal(JSON.parse(await readFile(join(directory, 'receipt.json'), 'utf8')).version, '0.5.2');
+  assert.equal(JSON.parse(await readFile(join(directory, 'receipt.json'), 'utf8')).version, '0.5.3');
 });
 
 test('bad checksums cannot install a server or fall back to an older release', async t => {
-  const config = await fixture(t, { serverVersion: '0.5.2' });
+  const config = await fixture(t, { serverVersion: '0.5.3' });
   const archive = tar(Buffer.from('unchecked'));
-  const bad = github(archive, '0.5.2', { checksum: '0'.repeat(64) });
+  const bad = github(archive, '0.5.3', { checksum: '0'.repeat(64) });
   await assert.rejects(resolveServer(config, undefined, bad), /SHA-256 mismatch/);
   assert.deepEqual(await readdir(config.serverCacheDirectory), []);
-  const valid = github(archive);
+  const valid = github(archive, '0.5.3');
   await resolveServer({ ...config, serverVersion: 'latest' }, undefined, valid);
-  await assert.rejects(resolveServer({ ...config, serverVersion: 'latest' }, undefined, github(archive, '0.5.3', { checksum: '0'.repeat(64) })), /disagree/);
+  await assert.rejects(resolveServer({ ...config, serverVersion: 'latest' }, undefined, github(archive, '0.5.4', { checksum: '0'.repeat(64) })), /disagree/);
 });
 
 test('GitHub redirects, streaming size bounds, cancellation and download deadlines are enforced', async t => {
@@ -224,10 +238,10 @@ test('GitHub redirects, streaming size bounds, cancellation and download deadlin
   assert.deepEqual(await readdir(config.serverCacheDirectory), []);
 });
 
-test('default plugin installs lazily and reuses its server resolution across workspaces', { skip: process.platform === 'win32' && 'fixture is a Unix executable script' }, async t => {
+test('default plugin installs lazily and reuses its server resolution across workspaces', { skip: process.platform === 'win32' && 'the downloaded mock server is a JavaScript fixture while Windows release assets are PE binaries' }, async t => {
   const config = await fixture(t, { vanillaMode: 'disabled', autoRefresh: false });
   const script = await readFile(new URL('./fixtures/server.mjs', import.meta.url));
-  const mock = github(tar(script), '0.5.2', { platform: process.platform, arch: process.arch, artifact: platformArtifact() });
+  const mock = github(pack(script), '0.5.3', { platform: process.platform, arch: process.arch, artifact: platformArtifact() });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mock.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -236,9 +250,9 @@ test('default plugin installs lazily and reuses its server resolution across wor
   assert.equal(mock.calls.length, 0);
   const result = await h.call('paradoxcode_workspace');
   assert.equal(result.isError, false, JSON.stringify(result));
-  assert.equal(result.value.result.server.version, '0.5.2');
+  assert.equal(result.value.result.server.version, '0.5.3');
   assert.equal(mock.calls.length, 3);
-  const second = await h.call('paradoxcode_workspace', { workspace: join(config.serverCacheDirectory, '0.5.2-' + platformArtifact().target) });
+  const second = await h.call('paradoxcode_workspace', { workspace: join(config.serverCacheDirectory, '0.5.3-' + platformArtifact().target) });
   assert.equal(second.isError, false, JSON.stringify(second));
   assert.equal(mock.calls.length, 3);
 });
@@ -264,10 +278,11 @@ test('plugin disposal cancels an in-flight automatic download', { timeout: 3000 
   assert.deepEqual(await readdir(config.serverCacheDirectory), []);
 });
 
-test('plugin refuses a downloaded executable that advertises a different LSP version', { skip: process.platform === 'win32' && 'fixture is a Unix executable script' }, async t => {
+test('plugin refuses a downloaded executable that advertises a different LSP version', { skip: process.platform === 'win32' && 'the downloaded mock server is a JavaScript fixture while Windows release assets are PE binaries' }, async t => {
   const config = await fixture(t, { vanillaMode: 'disabled', autoRefresh: false });
   const script = await readFile(new URL('./fixtures/server.mjs', import.meta.url));
-  const mock = github(tar(script), '0.5.3', { artifact: platformArtifact() });
+  // The release resolves as 0.5.4 while the fixture reports 0.5.3: the mismatch must be refused.
+  const mock = github(pack(script), '0.5.4', { artifact: platformArtifact() });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mock.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -275,16 +290,16 @@ test('plugin refuses a downloaded executable that advertises a different LSP ver
   t.after(() => h.dispose());
   const result = await h.call('paradoxcode_workspace');
   assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /reported server version 0.5.2/);
+  assert.match(result.content[0].text, /reported server version 0.5.3/);
 });
 
-test('installation needs no user configuration: download, Mod detection and game discovery are default', { skip: process.platform === 'win32' && 'fixture is a Unix executable script' }, async t => {
+test('installation needs no user configuration: download, Mod detection and game discovery are default', { skip: process.platform === 'win32' && 'the downloaded mock server is a JavaScript fixture while Windows release assets are PE binaries' }, async t => {
   const config = await fixture(t);
   const mod = join(config.serverCacheDirectory, 'example-mod');
   await mkdir(join(mod, 'events'), { recursive: true });
   await writeFile(join(mod, 'descriptor.mod'), 'name="Example"\n');
   const script = await readFile(new URL('./fixtures/server.mjs', import.meta.url));
-  const mock = github(tar(script), '0.5.2', { artifact: platformArtifact() });
+  const mock = github(pack(script), '0.5.3', { artifact: platformArtifact() });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mock.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -294,7 +309,7 @@ test('installation needs no user configuration: download, Mod detection and game
   const result = await h.call('paradoxcode_workspace', {}, undefined, { session: { header: { cwd: join(mod, 'events') } } });
   assert.equal(result.isError, false, JSON.stringify(result));
   assert.equal(result.value.workspace, mod);
-  assert.equal(result.value.result.server.version, '0.5.2');
+  assert.equal(result.value.result.server.version, '0.5.3');
   assert.equal(result.value.result.initializationOptions.vanillaMode, 'auto');
   assert.equal(mock.calls.length, 3);
 });

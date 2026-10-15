@@ -1,19 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
 import { parse } from 'jsonc-parser';
 import { Config, normalizeConfig } from '../lib/config.js';
 import { dependencyChain } from '../lib/dependencies.js';
 import { loadWorkspace, readSettings, saveDependencies } from '../lib/settings.js';
 import { WorkspacePool } from '../lib/workspace.js';
-import { harness } from './helpers.mjs';
+import { harness, removeTempDir, tempDir } from './helpers.mjs';
 
 const serverPath = resolve('test/fixtures/server.mjs');
 async function fixture(t) {
-  const parent = await mkdtemp(join(tmpdir(), 'dsh-settings-test-'));
-  t.after(() => rm(parent, { recursive: true, force: true }));
+  const parent = await tempDir('dsh-settings-test-');
+  t.after(() => removeTempDir(parent));
   const roots = Object.fromEntries(['main', 'A', 'B', 'C', 'D'].map(name => [name, join(parent, name)]));
   for (const root of Object.values(roots)) await mkdir(root);
   return roots;

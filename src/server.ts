@@ -10,14 +10,17 @@ const REPOSITORY = 'danxiaogu520/ParadoxCode';
 const RELEASES = `https://github.com/${REPOSITORY}/releases/download`;
 const VERSION = /^\d+\.\d+\.\d+$/;
 const DIGEST = /^[a-f0-9]{64}$/;
-export const BOOTSTRAP_VERSION = '0.5.2';
+/** Newest release whose asset layout this build knows, used only for the offline cold-start fallback. */
+export const BOOTSTRAP_VERSION = '0.5.3';
+/** Oldest supported server. 0.5.3 introduced whole-file transcoding and native query paging. */
+export const MINIMUM_VERSION = '0.5.3';
 
 function versionParts(version: string): number[] { return version.split('.').map(Number); }
 function compareVersions(a: string, b: string): number {
   const aa = versionParts(a), bb = versionParts(b);
   return aa[0]! - bb[0]! || aa[1]! - bb[1]! || aa[2]! - bb[2]!;
 }
-function compatible(version: string): boolean { return VERSION.test(version) && compareVersions(version, BOOTSTRAP_VERSION) >= 0; }
+function compatible(version: string): boolean { return VERSION.test(version) && compareVersions(version, MINIMUM_VERSION) >= 0; }
 
 export interface ServerResolution {
   path: string;
@@ -45,6 +48,8 @@ class DownloadError extends Error {
 }
 
 function sha256(bytes: Buffer): string { return createHash('sha256').update(bytes).digest('hex'); }
+
+function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function defaultCacheDirectory(): string {
   const home = homedir();
@@ -213,10 +218,14 @@ async function install(root: string, version: string, artifact: ServerArtifact, 
     await rename(join(staging, 'receipt.json'), join(directory, 'receipt.json'));
     return { path: join(directory, artifact.binary), source: 'github', version, target: artifact.target };
   } catch (error) {
-    // Windows can deny replacing an executable already started by a concurrent profile.
+    // Windows denies replacing an executable that a concurrent profile is publishing right now,
+    // so wait briefly for the verified cache instead of failing the whole resolution.
     if (['EACCES', 'EPERM', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) {
-      const concurrent = await cachedServer(root, version, artifact, archiveSha256);
-      if (concurrent) return concurrent;
+      for (let attempt = 0; attempt < 40; attempt++) {
+        const concurrent = await cachedServer(root, version, artifact, archiveSha256);
+        if (concurrent) return concurrent;
+        await wait(50);
+      }
     }
     throw error;
   } finally { await rm(staging, { recursive: true, force: true }); }
@@ -232,8 +241,14 @@ export async function resolveServer(config: Config, signal?: AbortSignal, option
   const deadline = AbortSignal.timeout(config.downloadTimeoutMs);
   const active = signal ? AbortSignal.any([signal, deadline]) : deadline;
   const latest = config.serverVersion === 'latest';
+  // Only 0.5.3+ is supported: whole-file transcoding and native query paging are required.
+  const requireSupported = (version: string): string => {
+    if (!VERSION.test(version)) throw new Error(`Unsupported ParadoxCode version "${version}"`);
+    if (!compatible(version)) throw new Error(`ParadoxCode ${version} is older than the required ${MINIMUM_VERSION}; upgrade the server (serverVersion: latest) instead of pinning an unsupported release.`);
+    return version;
+  };
   try {
-    let version = config.serverVersion;
+    let version = latest ? config.serverVersion : requireSupported(config.serverVersion);
     let apiDigest: string | undefined;
     if (latest) {
       const bytes = await fetchBytes(`https://api.github.com/repos/${REPOSITORY}/releases/latest`, 1024 * 1024, active, fetcher);
@@ -242,6 +257,7 @@ export async function resolveServer(config: Config, signal?: AbortSignal, option
         || release.assets.some(entry => !entry || typeof entry !== 'object' || typeof entry.name !== 'string')) throw new Error('GitHub returned an invalid stable release');
       version = release.tag_name.replace(/^v/, '');
       if (!VERSION.test(version)) throw new Error('GitHub returned an unsupported release version');
+      requireSupported(version);
       const name = `paradoxcode-v${version}-${artifact.target}.${artifact.extension}`;
       const asset = release.assets.find(entry => entry.name === name);
       if (!asset || !release.assets.some(entry => entry.name === `${name}.sha256`)) throw new Error(`ParadoxCode ${version} has no archive/checksum for ${artifact.target}. Configure serverPath with a local executable.`);

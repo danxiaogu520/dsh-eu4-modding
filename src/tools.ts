@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { readFile, realpath, stat } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineTool, type ParameterSchemaSpec, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { inheritedDefaults, type Config } from './config.js';
 import { object, type Json, type JsonObject } from './json.js';
-import { logicalPath, within, type WorkspacePool, type WorkspaceSession } from './workspace.js';
+import { logicalPath, within, damageSummary, type WorkspacePool, type WorkspaceSession } from './workspace.js';
+import { writeSourceFile, type WriteBridges } from './write.js';
 import { manageDependencies } from './dependencies.js';
 import { ResultStore, assertSnapshotInput, diagnosticPage, nativeSummary } from './results.js';
 
@@ -13,7 +14,7 @@ interface Spec {
   name: string;
   description: string;
   parameters: ParameterSchemaSpec;
-  run?(session: WorkspaceSession, args: JsonObject, signal: AbortSignal): Promise<Json>;
+  run?(session: WorkspaceSession, args: JsonObject, signal: AbortSignal, exec?: ToolRunContext): Promise<Json>;
   manage?(base: string, config: Config, args: JsonObject, signal: AbortSignal): Promise<Json>;
 }
 
@@ -77,19 +78,66 @@ function diagnosticsSnapshot(session: WorkspaceSession, kind: string, args: Json
   return { ...diagnosticPage(value, { ...input, ...args }, offset, limit), snapshot: token, countsScope: kind.startsWith('disk:') ? 'returned file page before diagnostic slicing' : 'joint draft batch' };
 }
 
-async function queryPage(session: WorkspaceSession, method: string, args: JsonObject, params: JsonObject, signal: AbortSignal): Promise<Json> {
+async function queryPage(session: WorkspaceSession, method: string, args: JsonObject, params: JsonObject, signal: AbortSignal, fallback?: JsonObject): Promise<Json> {
   const offset = number(args, 'offset', 0, 0, 10000000);
   const revision = args.revision;
-  const experimental = session.connection.capabilities.experimental;
-  const supported = experimental && typeof experimental === 'object' && !Array.isArray(experimental) && experimental.pdcQueryPagination === true;
-  if (offset && !supported) throw new Error('This server does not support legacy query pagination. Use paradoxcode_query with revision/snapshot, or install the supplied ParadoxCode patch.');
+  const supported = session.supports('pdcQueryPagination');
+  // 0.5.3 introduced native continuation on these endpoints; older servers must be upgraded.
+  const alternative = fallback
+    ? `Use paradoxcode_query ${JSON.stringify(fallback)} (then follow its revision and snapshot), or upgrade to ParadoxCode 0.5.3 or newer.`
+    : 'Use paradoxcode_query, or upgrade to ParadoxCode 0.5.3 or newer.';
+  if (!supported) throw new Error(`This server does not advertise pdcQueryPagination, so query paging is unavailable. ${alternative}`);
   if (revision !== undefined && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0)) throw new Error('revision must be a non-negative integer');
   if (offset && revision === undefined) throw new Error('Continuations require the revision returned by the first page');
-  const result = object(await session.request(method, { ...params, ...(supported ? { offset, ...(revision !== undefined ? { revision } : {}) } : {}) }, signal));
-  return { ...result, continuationSupported: !!supported, ...(!supported && result.truncated === true ? { continuation: 'Use paradoxcode_query to continue with the server search snapshot' } : {}) };
+  const result = object(await session.request(method, { ...params, offset, ...(revision !== undefined ? { revision } : {}) }, signal));
+  return { ...result, continuationSupported: true };
 }
 
-const queryParameters = { offset: integer('Result offset, default 0; continuations require a server advertising query pagination'), revision: integer('Revision returned by the first page; required when offset > 0') };
+const queryParameters = { offset: integer('Result offset, default 0'), revision: integer('Revision returned by the first page; required when offset > 0') };
+
+/** Enum parameters are validated here as well as in the schema, so a typo never degrades silently. */
+function option<T extends string>(args: JsonObject, key: string, allowed: readonly T[], fallback: T): T {
+  const value = text(args, key) ?? fallback;
+  if (!allowed.includes(value as T)) throw new Error(`${key} must be one of ${allowed.join(', ')}`);
+  return value as T;
+}
+
+/** Whole-file conversion arrived in 0.5.3; older servers are unsupported by design. */
+function requireWholeFileTranscode(session: WorkspaceSession): void {
+  if (!session.supports('pdcWholeFileTranscode')) {
+    throw new Error('Transcoding requires ParadoxCode 0.5.3 or newer (pdcWholeFileTranscode). Upgrade the server with serverVersion: latest; the quote-only API of older servers is not supported.');
+  }
+}
+
+/** Turn a 0.5.3 refusal into a concrete next step. */
+function refusalAdvice(result: JsonObject): string {
+  const refused = String(result.refused);
+  if (refused === 'invalidUtf8') return 'The input is not valid UTF-8, so the whole conversion was refused without partial output. Read the indexed value with paradoxcode_localisation keyMatch:"exact", or repair the bytes first.';
+  if (refused === 'brokenEscape') return `An escape triple is incomplete at byte ${Array.isArray(result.offsets) ? result.offsets[0] : '?'}; the whole conversion was refused. Fix that position and retry.`;
+  if (refused === 'unencodable') return `${Array.isArray(result.points) ? result.points.length : 0} character(s) cannot be represented in this profile (see points[].codePoint); the whole conversion was refused. Replace or drop those characters.`;
+  return `The backend refused the whole conversion (refused=${refused}) without producing bytes.`;
+}
+
+/** Trim text to a UTF-8 byte budget without splitting a surrogate pair. */export function clipUtf8(text: string, budget: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= budget) return text;
+  let end = Math.min(text.length, budget);
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), 'utf8') > budget) {
+    const over = Buffer.byteLength(text.slice(0, end), 'utf8') - budget;
+    end = Math.max(0, end - Math.max(1, Math.ceil(over / 3)));
+  }
+  if (end > 0 && end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+  return text.slice(0, end);
+}
+
+/** Map the entry array of a server search response, whatever key the backend used. */
+function mapEntries(result: Json, map: (entry: JsonObject) => JsonObject): Json {
+  const value = object(result);
+  for (const key of ['hits', 'items', 'entries', 'results']) {
+    const entries = value[key];
+    if (Array.isArray(entries)) return { ...value, [key]: entries.map(entry => map(object(entry))) };
+  }
+  return result;
+}
 
 function readStoredResult(store: ResultStore, args: JsonObject, budget: number): Json {
   const token = text(args, 'token', true)!;
@@ -140,18 +188,110 @@ const specs: Spec[] = [
     },
   },
   {
+    name: 'paradoxcode_read',
+    description: 'Read an indexed source file from any root (Mod, dependency or Vanilla) with encoding-transparent decoding: UTF-8 is returned unchanged, legacy Chinese and EDG glyph-encoded files are decoded through the ParadoxCode transcode profile for that path. Returns a line window with root, encoding, damage and hash metadata; never writes. Continue with nextOffset, and with nextCharacter when a single line is longer than the display budget. Dependencies and legacy encodings are exactly what the built-in read tool refuses.',
+    parameters: {
+      path: string('Mod-relative path, absolute path inside an indexed root, or file: URI', true),
+      offset: integer('First 1-based line, default 1'),
+      limit: integer('Maximum lines, default 400'),
+      character: integer('0-based UTF-16 column inside the first line, default 0'),
+    },
+    async run(session, args, signal) {
+      const raw = text(args, 'path', true)!;
+      const offset = number(args, 'offset', 1, 1, 100000000);
+      const limit = number(args, 'limit', 400, 1, 100000);
+      const character = number(args, 'character', 0, 0, 10000000);
+      const target = raw.startsWith('file:') ? fileURLToPath(raw) : isAbsolute(raw) ? raw : resolve(session.root, logicalPath(raw));
+      const resolved = await realpath(target);
+      const location = session.locate(resolved);
+      const file = await session.decodeFile(resolved, signal);
+      const lines = file.text.split(/\r\n|\n|\r/);
+      const start = offset - 1;
+      if (start < lines.length && character > lines[start]!.length) throw new Error('character exceeds the length of that line (0-based UTF-16 column)');
+      const budget = Math.max(2048, session.outputBudget - 2000);
+      const parts: string[] = [];
+      let line = start, column = character, bytes = 0, lastIndex = -1, clippedInLast = false;
+      while (line < lines.length && parts.length < limit) {
+        const piece = column ? (lines[line] ?? '').slice(column) : (lines[line] ?? '');
+        const size = Buffer.byteLength(piece, 'utf8') + (parts.length ? 1 : 0);
+        if (parts.length && bytes + size > budget) break;
+        if (!parts.length && size > budget) {
+          const cut = clipUtf8(piece, budget);
+          parts.push(cut); bytes += Buffer.byteLength(cut, 'utf8');
+          lastIndex = line; clippedInLast = true; column += cut.length;
+          break;
+        }
+        parts.push(piece); bytes += size; lastIndex = line; clippedInLast = false; line++; column = 0;
+      }
+      const text_ = parts.join('\n');
+      const remaining = clippedInLast || line < lines.length;
+      const warning = file.lossy ? `Bytes are not faithfully decodable${damageSummary(file.damage) ? ` (${damageSummary(file.damage)})` : ''}: this text contains replacement characters and must not be written back.` : null;
+      return {
+        path: location.logicalPath, root: location.id, rootPath: location.root, writable: location.writable,
+        bytes: file.bytes.length, sha256: file.sha256, encoding: file.encoding, lossy: file.lossy,
+        totalLines: lines.length, firstLine: lastIndex < 0 ? null : offset, lastLine: lastIndex < 0 ? null : lastIndex + 1,
+        truncated: remaining, lineIncomplete: clippedInLast,
+        nextOffset: remaining ? (clippedInLast ? lastIndex + 1 : lastIndex + 2) : null,
+        nextCharacter: remaining && clippedInLast ? column : null,
+        text: text_,
+        ...(file.damage ? { damage: file.damage } : {}),
+        ...(warning ? { warning } : {}),
+      };
+    },
+  },
+  {
+    name: 'paradoxcode_write',
+    description: 'Write one Mod file with whole-file, encoding-transparent conversion. The representation follows the file: a UTF-8 target stays UTF-8 and goes through DSH\'s own atomic writer, while a target whose bytes are not UTF-8 keeps its encoded form and is published byte-exactly by the plugin. Preview by default (apply:false checks everything and returns a diff summary without touching disk). Overwrites require the expectedSha256 from paradoxcode_read, the Mod root is the only writable root, and the original bytes are saved under _maintenance before a write. Requires ParadoxCode 0.5.3 or newer.',
+    parameters: {
+      path: string('Mod-relative path of the file to write', true),
+      text: string('Complete new file content as UTF-8 text; "" writes an empty file', true),
+      expectedSha256: string('SHA-256 of the current bytes from paradoxcode_read; required to overwrite, rejected when the file does not exist'),
+      encode: { type: 'boolean', description: 'Store the escaped/encoded form via the transcode profile even for plain text (default: follow the existing file; new files are UTF-8)' },
+      apply: { type: 'boolean', description: 'Default false: check everything and return the preview only' },
+    },
+  },
+  {
     name: 'paradoxcode_workspace',
-    description: 'Orient in an EU4 Mod: indexed Mod/dependency/Vanilla roots, rule identity, revision, file counts and scan coverage. Call first. Missing Vanilla data or incomplete coverage limits what a clean diagnostic result proves.',
-    parameters: {},
-    async run(session, _args, signal) {
+    description: 'Orient in an EU4 Mod: indexed Mod/dependency/Vanilla roots, rule identity, revision, file counts, scan coverage and server feature support. Call first. Missing Vanilla data or an older server limits what a clean diagnostic result proves. roots[].sourceRootId is the numeric id paradoxcode_query accepts in roots; roots[].id is the stable dependency id.',
+    parameters: { detail: { type: 'string', enum: ['summary', 'full'], description: 'Default summary omits per-category symbol statistics; full returns the complete server summary' } },
+    async run(session, args, signal) {
+      const detail = option(args, 'detail', ['summary', 'full'] as const, 'summary');
       const summary = object(await session.request('pdc/workspaceSummary', undefined, signal));
+      const { symbols, ...rest } = summary;
+      // 0.5.3 reports its own scope strings; fall back to explicit wording for older servers.
+      const scan = summary.scan;
+      const serverScope = (value: Json): string | undefined => {
+        const holder = value && typeof value === 'object' && !Array.isArray(value) ? object(value) : {};
+        return typeof holder.scope === 'string' ? holder.scope : undefined;
+      };
+      const summarized: JsonObject = detail === 'full' || symbols === undefined ? { ...summary } : {
+        ...rest,
+        symbols: { omitted: true, scope: 'All indexed roots, including Vanilla and dependencies', hint: 'Call paradoxcode_workspace with detail:"full" for per-category definition and reference counts.' },
+      };
       const roots = (Array.isArray(summary.roots) ? summary.roots : []).map(entry => {
         const root = object(entry);
         const dependency = session.shared?.dependencies.find(dep => dep.path === root.path);
         return { ...root, sourceRootId: root.id ?? null, id: dependency?.id ?? (root.kind === 'vanilla' ? 'vanilla' : root.writable ? 'mod' : null) };
       });
-      return { ...summary, roots, fileCountsScope: 'All indexed Mod, dependency and Vanilla roots', scanScope: 'Live source roots scanned during the last refresh; installed dependency/Vanilla index caches are excluded', capabilities: session.connection.capabilities, synchronization: session.synchronization(), server: { ...session.server, info: session.connection.serverInfo },
-        configuration: session.shared ? { settingsFile: session.shared.settings.path, dependenciesSource: session.shared.dependenciesSource, dependencies: session.shared.dependencies.map(row => ({ ...row })), inheritedDefaults, inheritance: 'Omitted settings inherit VS Code; defaults apply only when neither client supplies a value', effective: session.shared.options } : null };
+      const experimental = object(session.connection.capabilities.experimental ?? {});
+      const serverFeatures = {
+        queryPagination: session.supports('pdcQueryPagination'),
+        hiddenEventOptions: session.supports('pdcHiddenEventOptions'),
+        scanDetails: session.supports('pdcScanDetails'),
+        wholeFileTranscode: session.supports('pdcWholeFileTranscode'),
+      };
+      const missing: JsonObject[] = [];
+      if (!serverFeatures.queryPagination) missing.push({ feature: 'queryPagination', effect: 'Rules, localisation, symbol search and symbol references cannot continue with offset/revision.', needs: 'ParadoxCode 0.5.3 or newer' });
+      if (!serverFeatures.hiddenEventOptions) missing.push({ feature: 'hiddenEventOptions', effect: 'Hidden events (hidden = yes) are reported as missing the required key `option`; that diagnostic is a false positive on this server version.', needs: 'ParadoxCode 0.5.3 or newer' });
+      if (!serverFeatures.scanDetails) missing.push({ feature: 'scanDetails', effect: 'Scan exclusions (for example *.bak or out-of-profile files) are counted without per-entry detail or scanned-root identity.', needs: 'ParadoxCode 0.5.3 or newer' });
+      if (!serverFeatures.wholeFileTranscode) missing.push({ feature: 'wholeFileTranscode', effect: 'paradoxcode_transcode_preview and paradoxcode_write refuse to run: whole-file conversion is unavailable.', needs: 'ParadoxCode 0.5.3 or newer' });
+      return {
+        ...summarized,
+        roots, fileCountsScope: typeof summary.fileCountsScope === 'string' ? summary.fileCountsScope : 'All indexed Mod, dependency and Vanilla roots', scanScope: serverScope(scan ?? null) ?? 'Live source roots scanned during the last refresh; installed dependency/Vanilla index caches are excluded',
+        serverFeatures: { ...serverFeatures, missing, upgradeRequired: missing.length > 0, available: Object.keys(experimental) },
+        capabilities: session.connection.capabilities, synchronization: session.synchronization(), server: { ...session.server, info: session.connection.serverInfo },
+        configuration: session.shared ? { settingsFile: session.shared.settings.path, dependenciesSource: session.shared.dependenciesSource, dependencies: session.shared.dependencies.map(row => ({ ...row })), inheritedDefaults, inheritance: 'Omitted settings inherit VS Code; defaults apply only when neither client supplies a value', effective: session.shared.options } : null,
+      };
     },
   },
   {
@@ -172,7 +312,8 @@ const specs: Spec[] = [
     async run(session, args, signal) {
       const filters = Object.fromEntries(['context', 'key', 'scope'].flatMap(key => text(args, key) ? [[key, text(args, key)!]] : []));
       if (!Object.keys(filters).length) throw new Error('Supply at least one of context, key or scope');
-      return queryPage(session, 'pdc/ruleSearch', args, { ...filters, limit: number(args, 'limit', 20, 1, 50) }, signal);
+      const query = filters.key ?? filters.context ?? filters.scope ?? '';
+      return queryPage(session, 'pdc/ruleSearch', args, { ...filters, limit: number(args, 'limit', 20, 1, 50) }, signal, { action: 'search', tab: 'rules', query });
     },
   },
   {
@@ -182,7 +323,7 @@ const specs: Spec[] = [
     async run(session, args, signal) {
       const query = text(args, 'query', true)!;
       if ([...query].length < 2) throw new Error('query must contain at least two characters');
-      return queryPage(session, 'pdc/symbolSearch', args, { query, limit: number(args, 'limit', 20, 1, 100) }, signal);
+      return queryPage(session, 'pdc/symbolSearch', args, { query, limit: number(args, 'limit', 20, 1, 100) }, signal, { action: 'search', tab: 'definitions', query });
     },
   },
   {
@@ -190,18 +331,34 @@ const specs: Spec[] = [
     description: 'Find a script definition and its uses by exact name before editing, removing or renaming it. Supply kind to disambiguate. Preserve matched/reason/candidates, total and truncation when assessing impact.',
     parameters: { ...queryParameters, name: string('Exact event id, scripted effect name, tag, etc.', true), kind: string('Optional symbol kind, such as event or scripted_effect'), limit: integer('1–100, default 50') },
     async run(session, args, signal) {
-      return queryPage(session, 'pdc/symbolReferences', args, { name: text(args, 'name', true)!, ...(text(args, 'kind') ? { kind: text(args, 'kind')! } : {}), limit: number(args, 'limit', 50, 1, 100) }, signal);
+      const name = text(args, 'name', true)!;
+      return queryPage(session, 'pdc/symbolReferences', args, { name, ...(text(args, 'kind') ? { kind: text(args, 'kind')! } : {}), limit: number(args, 'limit', 50, 1, 100) }, signal,
+        { action: 'search', tab: 'definitions', query: name });
     },
   },
   {
     name: 'paradoxcode_localisation',
-    description: 'Search indexed localisation by exact key, key prefix/substring, or displayed text. Use exact for known event titles and prefix for a key family. Returns winning definitions, language and values; previews may be bounded by the server.',
-    parameters: { ...queryParameters, key: string('Localisation key or prefix'), keyMatch: { type: 'string', enum: ['exact', 'prefix', 'substring'], description: 'Default exact' }, text: string('Displayed-value substring'), limit: integer('1–50, default 20') },
+    description: 'Search indexed localisation by exact key, key prefix/substring, or displayed text. Use exact for known event titles and prefix for a key family. Returns winning definitions, language and values; previews may be bounded by the server. Use values:"none" to enumerate keys first and fetch text afterwards.',
+    parameters: {
+      ...queryParameters,
+      key: string('Localisation key or prefix'), keyMatch: { type: 'string', enum: ['exact', 'prefix', 'substring'], description: 'Default exact' }, text: string('Displayed-value substring'), limit: integer('1–50, default 20'),
+      values: { type: 'string', enum: ['full', 'truncated', 'none'], description: 'full (default) returns complete values; truncated clips each value to 400 characters; none returns key, file, language and valueLength only' },
+    },
     async run(session, args, signal) {
       const key = text(args, 'key');
       const value = text(args, 'text');
       if (!key && !value?.trim()) throw new Error('Supply key or non-empty text');
-      return queryPage(session, 'pdc/localisationSearch', args, { ...(key ? { key } : {}), ...(value ? { text: value } : {}), keyMatch: text(args, 'keyMatch') ?? 'exact', limit: number(args, 'limit', 20, 1, 50) }, signal);
+      const values = option(args, 'values', ['full', 'truncated', 'none'] as const, 'full');
+      const query = key ?? value ?? '';
+      if (!query.trim()) throw new Error('Supply key or non-empty text');
+      const result = await queryPage(session, 'pdc/localisationSearch', args, { ...(key ? { key } : {}), ...(value ? { text: value } : {}), keyMatch: text(args, 'keyMatch') ?? 'exact', limit: number(args, 'limit', 20, 1, 50) }, signal,
+        { action: 'search', tab: 'localisation', query });
+      if (values === 'full') return result;
+      return mapEntries(result, hit => {
+        const length = typeof hit.value === 'string' ? [...hit.value].length : null;
+        if (values === 'none') { const { value: _omitted, ...rest } = hit; return { ...rest, valueLength: length }; }
+        return typeof hit.value === 'string' && hit.value.length > 400 ? { ...hit, value: hit.value.slice(0, 400), valueLength: length, valueTruncated: true } : { ...hit, valueLength: length };
+      });
     },
   },
   {
@@ -261,7 +418,7 @@ const specs: Spec[] = [
   },
   {
     name: 'paradoxcode_document',
-    description: 'Inspect an EU4 document: hover explains rules/scopes, completion suggests valid keys/values, definition/references find locations, symbols lists document structure. Optional text analyzes a temporary draft at a Mod-relative path. Input line is 1-based and character is 0-based UTF-16; returned LSP positions are 0-based.',
+    description: 'Inspect an EU4 document: hover explains rules/scopes, completion suggests valid keys/values, definition/references find locations, symbols lists document structure. Legacy-encoded disk files are decoded internally through the transcode profile first, so cursor features work on dependency Mods too. Optional text analyzes a temporary draft at a Mod-relative path. Input line is 1-based and character is 0-based UTF-16; returned LSP positions are 0-based.',
     parameters: { ...cursor, action: { type: 'string', enum: ['hover', 'completion', 'definition', 'references', 'symbols'], required: true }, text: string('Optional full draft text; never written'), limit: integer('Completion/reference result limit 1–100, default 50'), offset: integer('Completion/reference offset, default 0'), snapshot: string('Snapshot from the first completion/reference page') },
     async run(session, args, signal) {
       const action = text(args, 'action', true)!;
@@ -328,17 +485,18 @@ const specs: Spec[] = [
   },
   {
     name: 'paradoxcode_transcode_preview',
-    description: 'Preview EU4 Chinese localisation/script encoding or decoding using ParadoxCode profiles. Never writes bytes. Decode accepts bytesHex or a Mod-relative disk file; encode requires readable text. Returns encoded bytes as hex and preserves refusal/damage metadata. Check eligible/refused/broken/damagedAt before applying any conversion.',
-    parameters: { path: string('Mod-relative target path deciding the encoding profile', true), action: { type: 'string', enum: ['decode', 'encode'], required: true }, text: string('Readable UTF-8 text to encode'), bytesHex: string('Optional even-length hexadecimal source bytes to decode'), quotedOnly: { type: 'boolean', description: 'Decode only quoted escape triples; default false' }, preserveEscaped: { type: 'boolean', description: 'Preserve existing quoted escapes while encoding; default false' } },
+    description: 'Preview EU4 Chinese localisation/script encoding or decoding using ParadoxCode profiles. Never writes bytes. Decode accepts bytesHex or a Mod-relative disk file; encode requires readable text. Conversion is all-or-nothing: a damaged or unencodable input is refused without partial output, and refusals name the cause (invalidUtf8, brokenEscape with offsets, unencodable with code points). Check eligible/refused before applying any conversion; use paradoxcode_write to publish encoded bytes.',
+    parameters: { path: string('Mod-relative target path deciding the encoding profile', true), action: { type: 'string', enum: ['decode', 'encode'], required: true }, text: string('Readable UTF-8 text to encode'), bytesHex: string('Optional even-length hexadecimal source bytes to decode') },
     async run(session, args, signal) {
+      requireWholeFileTranscode(session);
       const path = resolve(session.root, logicalPath(text(args, 'path', true)!));
       const action = text(args, 'action', true)!;
       let bytes: Buffer;
       if (action === 'encode') {
-        if (args.bytesHex !== undefined || args.quotedOnly !== undefined) throw new Error('encode accepts text and preserveEscaped, not bytesHex or quotedOnly');
+        if (args.bytesHex !== undefined) throw new Error('encode accepts text, not bytesHex');
         bytes = Buffer.from(text(args, 'text', true)!, 'utf8');
       } else {
-        if (args.text !== undefined || args.preserveEscaped !== undefined) throw new Error('decode accepts bytesHex and quotedOnly, not text or preserveEscaped');
+        if (args.text !== undefined) throw new Error('decode accepts bytesHex, not text');
         const hex = text(args, 'bytesHex');
         if (hex !== undefined) {
           if (!/^(?:[a-f\d]{2})*$/i.test(hex) || hex.length > 32 * 1024 * 1024) throw new Error('bytesHex must be even-length hexadecimal of at most 16 MiB');
@@ -352,13 +510,18 @@ const specs: Spec[] = [
         }
       }
       if (bytes.length > 16 * 1024 * 1024) throw new Error('Transcode input exceeds 16 MiB');
-      const result = object(await session.request(action === 'encode' ? 'pdc/transcodeEncode' : 'pdc/transcodeDecode', {
-        path, bytes: bytes.toString('hex'), ...(action === 'encode' ? { preserveEscaped: args.preserveEscaped ?? false } : { quotedOnly: args.quotedOnly ?? false }),
-      }, signal));
-      if (action === 'decode' && typeof result.bytes === 'string') {
-        try { result.text = new TextDecoder('utf8', { fatal: true }).decode(Buffer.from(result.bytes, 'hex')); } catch { /* retain exact bytes and backend damage metadata */ }
+      const result = object(await session.request(action === 'encode' ? 'pdc/transcodeEncode' : 'pdc/transcodeDecode', { path, bytes: bytes.toString('hex') }, signal));
+      if (action === 'decode' && typeof result.bytes === 'string' && result.refused === undefined) {
+        try { result.text = new TextDecoder('utf8', { fatal: true }).decode(Buffer.from(result.bytes, 'hex')); } catch { /* bytes are not UTF-8: keep them as hex */ }
       }
-      return { ...result, applied: false };
+      const damage = damageSummary(result);
+      const advice: string[] = [];
+      if (typeof result.refused === 'string') advice.push(refusalAdvice(result));
+      else if (typeof result.damagedAt === 'number') advice.push(`The file is damaged at byte ${result.damagedAt}; the whole conversion was refused, so nothing partial can be published. Fix the source bytes or fetch the indexed value with paradoxcode_localisation keyMatch:"exact".`);
+      else if (result.eligible === false) advice.push('This path is not eligible for a transcode profile. Check the owning root and prefer paradoxcode_read for decoded text.');
+      if (action === 'decode' && result.text === undefined && result.refused === undefined) advice.push('The returned bytes are not UTF-8, so no text field was added; keep working with bytes, or use paradoxcode_read which decodes whole files best-effort.');
+      if (action === 'encode' && typeof result.bytes === 'string') advice.push('Publish these bytes with paradoxcode_write (pass the same path); it re-runs the decode check and keeps a backup under _maintenance.');
+      return { ...result, applied: false, ...(damage ? { damageSummary: damage } : {}), ...(advice.length ? { advice } : {}) };
     },
   },
   {
@@ -371,7 +534,7 @@ const specs: Spec[] = [
 
 export const toolNames = specs.map(spec => spec.name);
 
-export function makeTools(config: Config, pool: WorkspacePool, getWorkspace: (args: JsonObject, exec: ToolRunContext) => string | Promise<string>): ToolDefinition[] {
+export function makeTools(config: Config, pool: WorkspacePool, getWorkspace: (args: JsonObject, exec: ToolRunContext) => string | Promise<string>, bridges: WriteBridges): ToolDefinition[] {
   return specs.map(spec => defineTool({
     name: spec.name,
     description: spec.description,
@@ -397,13 +560,17 @@ export function makeTools(config: Config, pool: WorkspacePool, getWorkspace: (ar
       }
       const workspace = await getWorkspace(input, exec);
       if (spec.name === 'paradoxcode_result') return pool.configure(workspace, exec.signal, async base => ({ workspace: base, result: readStoredResult(pool.resultsFor(base), input, config.maxOutputChars) }));
+      if (spec.name === 'paradoxcode_write') return pool.run(workspace, exec.signal, async session => {
+        const { value } = await writeSourceFile(session, input, exec, bridges, exec.signal);
+        return { workspace: session.root, result: value };
+      });
       if (spec.manage) return pool.configure(workspace, exec.signal, async (base, active) => {
         const value: { workspace: string; result: Json; retrieval?: Json } = { workspace: base, result: await spec.manage!(base, config, input, active) };
         if (JSON.stringify(value).length > config.maxOutputChars) value.retrieval = { tool: 'paradoxcode_result', token: pool.resultsFor(base).save('output', value), offset: 0 };
         return value;
       });
       return pool.run(workspace, exec.signal, async session => {
-        const value: { workspace: string; result: Json; retrieval?: Json } = { workspace: session.root, result: await spec.run!(session, input, exec.signal) };
+        const value: { workspace: string; result: Json; retrieval?: Json } = { workspace: session.root, result: await spec.run!(session, input, exec.signal, exec) };
         if (spec.name !== 'paradoxcode_result' && JSON.stringify(value).length > config.maxOutputChars) {
           value.retrieval = { tool: 'paradoxcode_result', token: session.results.save('output', value), offset: 0 };
         }

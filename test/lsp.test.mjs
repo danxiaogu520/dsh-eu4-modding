@@ -1,19 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { chmod, mkdir, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { LspConnection, LspError } from '../lib/lsp.js';
+import { removeTempDir, tempDir } from './helpers.mjs';
 
 const server = resolve('test/fixtures/server.mjs');
 await chmod(server, 0o755);
 
 async function fixture(t, mode, timeout = 1500) {
-  const parent = await mkdtemp(join(tmpdir(), 'dsh-lsp-test-'));
+  const parent = await tempDir('dsh-lsp-test-');
   const root = join(parent, mode);
   await mkdir(root);
   const connection = new LspConnection(server, root, { vanillaMode: 'disabled' }, timeout);
-  t.after(async () => { await connection.stop(); await rm(parent, { recursive: true, force: true }); });
+  t.after(async () => { await connection.stop(); await removeTempDir(parent); });
   return connection;
 }
 

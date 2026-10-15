@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { parse } from 'jsonc-parser';
-import { harness } from '../helpers.mjs';
+import { harness, tempDir } from '../helpers.mjs';
 
 const serverPath = process.env.PARADOXCODE_TEST_SERVER;
 const effect = 'dsh_demo_effect = { add_prestige = 5 }\n';
@@ -23,7 +22,7 @@ country_event = {
 const localisation = '\uFEFFl_english:\n dsh_demo.1.t:0 "Demo title"\n dsh_demo.1.d:0 "Demo description"\n dsh_demo.1.a:0 "Demo option"\n';
 
 test('real ParadoxCode: related drafts resolve together and leave no definitions or bytes behind', { skip: !serverPath, timeout: 360000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-real-joint-'));
+  const root = await tempDir('dsh-real-joint-');
   await mkdir(join(root, 'localisation'), { recursive: true });
   const original = '\uFEFFl_english:\n joint_old:0 "Old"\n';
   await writeFile(join(root, 'localisation/joint_l_english.yml'), original);
@@ -49,7 +48,7 @@ test('real ParadoxCode: related drafts resolve together and leave no definitions
 });
 
 test('real ParadoxCode: server search pages and document references can be exhausted without loss', { skip: !serverPath || serverPath === 'auto', timeout: 360000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-real-pages-'));
+  const root = await tempDir('dsh-real-pages-');
   for (const path of ['common/scripted_effects', 'events', 'common/custom_gui']) await mkdir(join(root, path), { recursive: true });
   const definitions = Array.from({ length: 60 }, (_, n) => `pagination_probe_effect_${n} = { add_prestige = 1 }`).join('\n');
   await writeFile(join(root, 'common/scripted_effects/pages.txt'), definitions);
@@ -106,7 +105,7 @@ test('real ParadoxCode: server search pages and document references can be exhau
 });
 
 test('real ParadoxCode: full agentic query, draft, edit, refresh and review workflow', { skip: !serverPath && 'Set PARADOXCODE_TEST_SERVER to auto or a standalone paradoxcode binary', timeout: serverPath === 'auto' ? 660000 : 360000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-real-pdc-'));
+  const root = await tempDir('dsh-real-pdc-');
   for (const dir of ['common/scripted_effects', 'events', 'localisation', 'missions']) await mkdir(join(root, dir), { recursive: true });
   await writeFile(join(root, 'common/scripted_effects/demo.txt'), effect);
   await writeFile(join(root, 'events/demo.txt'), event);
@@ -115,6 +114,9 @@ test('real ParadoxCode: full agentic query, draft, edit, refresh and review work
   const h = await harness({ ...(serverPath === 'auto' ? {} : { serverPath }), vanillaMode: 'disabled',
     ...(process.env.PARADOXCODE_TEST_CACHE ? { serverCacheDirectory: process.env.PARADOXCODE_TEST_CACHE } : {}),
     ...(process.env.PARADOXCODE_TEST_VERSION ? { serverVersion: process.env.PARADOXCODE_TEST_VERSION } : {}),
+  }, {
+    // Mirror a real session: the writer requires the file-effect policy service and publishes bytes itself.
+    sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: root }) },
   });
   t.after(async () => { await h.dispose(); await rm(root, { recursive: true, force: true }); });
   const agent = { session: { header: { cwd: join(root, 'events') } } };
@@ -186,17 +188,42 @@ test('real ParadoxCode: full agentic query, draft, edit, refresh and review work
   assert.ok(encoded.bytes && !encoded.refused, JSON.stringify(encoded));
   const decoded = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'localisation/chinese_l_english.yml', bytesHex: encoded.bytes });
   assert.ok(decoded.text.includes('中文'));
-  // 0.5.2 manual transcoding preserves comments and existing escape triples.
   const readable = 'l_english:\n # 中文 comment\n key:0 "中文"\n';
-  const quoted = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: readable, preserveEscaped: true });
-  assert.ok(quoted.bytes && !quoted.refused, JSON.stringify(quoted));
-  const partial = Buffer.from(quoted.bytes, 'hex').toString('utf8');
-  assert.ok(partial.includes('# 中文 comment'));
-  assert.ok(!partial.includes('key:0 "中文"'));
-  const preservedEscapes = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: partial, preserveEscaped: true });
-  assert.equal(preservedEscapes.bytes, quoted.bytes);
-  const decodedQuoted = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'localisation/chinese_l_english.yml', bytesHex: quoted.bytes, quotedOnly: true });
-  assert.equal(decodedQuoted.text, readable);
+  // 0.5.3 converts whole files and removed the quote-only options.
+  const roundTrip = await call('paradoxcode_transcode_preview', { action: 'encode', path: 'localisation/chinese_l_english.yml', text: readable });
+  assert.ok(roundTrip.bytes && !roundTrip.refused, JSON.stringify(roundTrip));
+  assert.match(roundTrip.advice.join(' '), /paradoxcode_write/);
+  const back = await call('paradoxcode_transcode_preview', { action: 'decode', path: 'localisation/chinese_l_english.yml', bytesHex: roundTrip.bytes });
+  assert.equal(back.text, readable);
+  await writeFile(join(root, 'localisation/encoded_l_english.yml'), Buffer.from('l_english:\n legacy:0 "\u00d6\u00d0\u00ce\u00c4"\n', 'latin1'));
+  const read = await call('paradoxcode_read', { path: 'localisation/encoded_l_english.yml' });
+  assert.equal(read.root, 'mod');
+  assert.equal(read.writable, true);
+  assert.ok(read.text.length > 0);
+
+  // paradoxcode_write: preview, publish, verify on disk, then overwrite behind the hash guard.
+  const target = 'localisation/written_l_english.yml';
+  const preview = await call('paradoxcode_write', { path: target, text: 'l_english:\n wkey:0 "中文写入"\n' });
+  assert.equal(preview.applied, false);
+  assert.equal(preview.mode, undefined);
+  await assert.rejects(stat(join(root, target)), /ENOENT/);
+  const created = await call('paradoxcode_write', { path: target, text: 'l_english:\n wkey:0 "中文写入"\n', apply: true });
+  assert.equal(created.applied, true, JSON.stringify(created));
+  assert.ok(created.backup === null);
+  const readBack = await call('paradoxcode_read', { path: target });
+  assert.equal(readBack.text, 'l_english:\n wkey:0 "中文写入"\n');
+  assert.equal(readBack.sha256, created.afterSha256);
+  const stale = await h.call('paradoxcode_write', { path: target, text: 'l_english:\n wkey:0 "x"\n', expectedSha256: 'a'.repeat(64), apply: true }, undefined, agent);
+  assert.equal(stale.isError, true);
+  assert.match(stale.content[0].text, /does not match expectedSha256/);
+  const overwritten = await call('paradoxcode_write', { path: target, text: 'l_english:\n wkey:0 "改名后的中文"\n', expectedSha256: readBack.sha256, apply: true });
+  assert.equal(overwritten.applied, true, JSON.stringify(overwritten));
+  assert.ok(overwritten.backup);
+  assert.equal(await readFile(join(root, overwritten.backup), 'utf8'), 'l_english:\n wkey:0 "中文写入"\n');
+  // The write marks the session dirty, so an explicit refresh makes the new text searchable.
+  await call('paradoxcode_refresh');
+  const searched = await call('paradoxcode_localisation', { key: 'wkey', keyMatch: 'exact' });
+  assert.ok(searched.hits.some(hit => String(hit.value).includes('改名后的中文')), JSON.stringify(searched));
 
   // Explicit refresh covers shell/outside-editor edits and discovers new files.
   await writeFile(join(root, 'common/scripted_effects/added.txt'), 'dsh_added_effect = { add_prestige = 1 }\n');
@@ -213,7 +240,7 @@ test('real ParadoxCode: full agentic query, draft, edit, refresh and review work
 });
 
 test('real ParadoxCode: installed defaults detect the Mod and discover game data without configuration', { skip: !serverPath && 'Set PARADOXCODE_TEST_SERVER to auto or a standalone paradoxcode binary', timeout: 660000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-real-defaults-'));
+  const root = await tempDir('dsh-real-defaults-');
   await mkdir(join(root, 'common', 'scripted_effects'), { recursive: true });
   await writeFile(join(root, 'descriptor.mod'), 'name="Default installation test"\n');
   await writeFile(join(root, 'common', 'scripted_effects', 'example.txt'), effect);
@@ -239,7 +266,7 @@ test('real ParadoxCode: installed defaults detect the Mod and discover game data
 });
 
 test('real ParadoxCode: shared VS Code settings load and synchronize a transitive dependency chain', { skip: !serverPath && 'Set PARADOXCODE_TEST_SERVER to auto or a standalone paradoxcode binary', timeout: 660000 }, async t => {
-  const parent = await mkdtemp(join(tmpdir(), 'dsh-real-dependencies-'));
+  const parent = await tempDir('dsh-real-dependencies-');
   const roots = Object.fromEntries(['main', 'A', 'B', 'C'].map(name => [name, join(parent, name)]));
   for (const [name, root] of Object.entries(roots)) {
     await mkdir(join(root, 'common', 'scripted_effects'), { recursive: true });

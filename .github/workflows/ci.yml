@@ -26,7 +26,23 @@ jobs:
       - run: npm run check:package
       - run: npm run docs:agents
       - run: git diff --exit-code -- AGENTS.md examples/AGENTS.md
-  server:
+  windows:
+    # The suite spawns language-server fixtures and locks their working directories, which behaves
+    # differently on Windows; keep a native Windows job so that platform cannot regress unnoticed.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run check:package
+  integration:
+    # Exercise the released server the plugin actually downloads. ParadoxCode 0.5.3 is the oldest
+    # supported release, so the job asserts the requirement instead of testing older servers.
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -36,23 +52,9 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - name: Obtain the exact upstream source
-        run: |
-          git init "$RUNNER_TEMP/paradoxcode"
-          git -C "$RUNNER_TEMP/paradoxcode" fetch --depth 1 https://github.com/danxiaogu520/ParadoxCode.git eae304594f5c987fa9723d12f46854e2861449ca
-          git -C "$RUNNER_TEMP/paradoxcode" checkout --detach FETCH_HEAD
-      - name: Apply server fixes
-        run: git -C "$RUNNER_TEMP/paradoxcode" apply "$GITHUB_WORKSPACE/patches/paradoxcode-0.5.3.patch"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ${{ runner.temp }}/paradoxcode -> target
-      - name: Server regressions and executable
-        working-directory: ${{ runner.temp }}/paradoxcode
-        run: |
-          cargo test --locked -p ide -p pdc --lib
-          cargo build --locked -p pdc --bin paradoxcode --profile test
-      - name: Real server integration
+      - name: Real server integration (downloaded, SHA-256 verified)
         env:
-          PARADOXCODE_TEST_SERVER: ${{ runner.temp }}/paradoxcode/target/debug/paradoxcode
+          PARADOXCODE_TEST_SERVER: auto
+          PARADOXCODE_TEST_VERSION: 0.5.3
+          PARADOXCODE_TEST_CACHE: ${{ runner.temp }}/pdc-cache
         run: npm run test:integration
