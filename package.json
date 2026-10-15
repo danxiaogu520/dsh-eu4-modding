@@ -1,6 +1,6 @@
 {
   "name": "dsh-eu4-modding",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "ParadoxCode language intelligence and draft validation for agentic EU4 modding in DeepSeek Harness",
   "repository": {
     "type": "git",
@@ -30,8 +30,7 @@
     "cordis.patch.yml",
     "README.md",
     "examples",
-    "LICENSE",
-    "patches"
+    "LICENSE"
   ],
   "keywords": [
     "dsh-plugin",

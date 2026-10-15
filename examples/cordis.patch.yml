@@ -16,7 +16,7 @@
     # preferredLocalisationLanguages: [english]
     # Optional: pin a verified server release, or use a local executable instead:
     # workspace: /absolute/path/to/your-mod
-    # serverVersion: 0.5.2
+    # serverVersion: 0.5.3
     # serverPath: /absolute/path/to/paradoxcode
     # serverCacheDirectory: /absolute/path/to/server-cache
     # downloadTimeoutMs: 300000
